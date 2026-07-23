@@ -1,0 +1,20 @@
+{
+    "server": {
+        "host": "localhost",
+        "port": 1301,
+        "max_clients": 100
+    },
+
+    "logging": {
+        "enabled": true,
+        "file": "data/logs/messages.log"
+    },
+
+    "crypto": {
+        "algorithm": "AES-128"
+    },
+
+    "client": {
+        "auto_reconnect": true
+    }
+}

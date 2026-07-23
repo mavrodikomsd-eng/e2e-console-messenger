@@ -1,7 +1,8 @@
 import socket
 import threading
 from datetime import datetime
-from crypto import decrypt_message, encrypt_message
+from modules.crypto import encrypt_message, decrypt_message
+from modules.config import config
 
 clients = []
 clients_lock = threading.Lock()
@@ -9,14 +10,16 @@ clients_lock = threading.Lock()
 def log_message(username, message_preview):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] {username}: {message_preview}"
-    with open("messages.txt", "a", encoding="utf-8") as f:
+    with open("messages.log", "a", encoding="utf-8") as f:
         f.write(log_entry + "\n")
 
 def broadcast(encrypted_message, sender_socket=None):
+    """Отправить сообщение всем клиентам кроме отправителя"""
     with clients_lock:
         for client_socket, client_address, username in clients:
             if client_socket != sender_socket:
                 try:
+                    # encrypted_message уже строка, кодируем в bytes
                     client_socket.send(encrypted_message.encode("utf-8"))
                 except:
                     pass
@@ -24,39 +27,55 @@ def broadcast(encrypted_message, sender_socket=None):
 def handle_client(client_socket, client_address):
     username = None
     try:
-        username = client_socket.recv(1024).decode("utf-8").strip()
+        # Получаем имя пользователя (приходит как bytes)
+        username_data = client_socket.recv(1024)
+        username = username_data.decode("utf-8").strip()
         if not username:
             username = f"User_{client_address[1]}"
         
         with clients_lock:
             clients.append((client_socket, client_address, username))
         
+        # Система сообщение о подключении
         join_message = f"\n[СИСТЕМА] {username} присоединился к чату\n"
         encrypted_join = encrypt_message(join_message)
         broadcast(encrypted_join, client_socket)
         print(f"[ПОДКЛЮЧЕНИЕ] {username} подключился с {client_address}")
         
         while True:
-            encrypted_data = client_socket.recv(1024).decode("utf-8").strip()
-            if not encrypted_data:
+            # Получаем зашифрованные данные (приходят как bytes)
+            encrypted_data_bytes = client_socket.recv(1024)
+            if not encrypted_data_bytes:
                 break
             
-            if encrypted_data.startswith("/") or encrypted_data.startswith(b"/"):
+            # Преобразуем bytes в строку для работы с decrypt_message
+            encrypted_data = encrypted_data_bytes.decode("utf-8").strip()
+            if not encrypted_data:
+                continue
+            
+            # Проверяем, является ли это командой
+            # encrypted_data уже строка, поэтому проверяем как строку
+            if encrypted_data.startswith("/"):
+                # Пытаемся расшифровать команду
                 decrypted = decrypt_message(encrypted_data)
                 if decrypted and decrypted.startswith("/"):
                     handle_command(decrypted, username, client_socket)
             else:
-                formatted_message = f"[{username}]: (зашифровано)\n"
+                # Обычное сообщение - логируем как зашифрованное
                 log_message(username, "(зашифровано)")
                 
+                # Пересылаем зашифрованное сообщение всем
                 broadcast(encrypted_data, client_socket)
                 
+                # Отправляем подтверждение отправителю
                 encrypted_confirm = encrypt_message(f"[ТЫ]: отправлено\n")
                 client_socket.send(encrypted_confirm.encode("utf-8"))
                 print(f"[{username}]: отправил зашифрованное сообщение")
     
-    except Exception as e:
-        print(f"[ОШИБКА] {e}")
+    except Exception:
+        print("\n========== TRACEBACK ==========")
+        traceback.print_exc()
+        print("===============================")
     
     finally:
         if username:
@@ -69,10 +88,13 @@ def handle_client(client_socket, client_address):
         client_socket.close()
 
 def handle_command(command, username, client_socket):
+    """Обработка команд от клиента"""
+    command = command.strip()
+    
     if command == "/users":
         with clients_lock:
             user_list = [u for _, _, u in clients]
-        response = f"\n[ПОЛЬЗОВАТЕЛИ] Онлайн: {', '.join(user_list)}\n"
+        response = f"\n[ПОЛЬЗОВАТЕЛИ] Онлайн ({len(user_list)}): {', '.join(user_list)}\n"
         encrypted_response = encrypt_message(response)
         client_socket.send(encrypted_response.encode("utf-8"))
     
@@ -89,7 +111,9 @@ def handle_command(command, username, client_socket):
     elif command == "/exit":
         client_socket.close()
 
-def start_server(host="localhost", port=1301):
+def start_server():
+    host = config["server"]["host"]
+    port = config["server"]["port"]
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((host, port))
