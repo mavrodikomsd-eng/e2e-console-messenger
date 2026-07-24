@@ -3,6 +3,8 @@ import threading
 import sys
 from modules.crypto import encrypt_message, decrypt_message
 from modules.config import config
+from modules.ui import show_banner, show_help
+from modules.commands import handle_command
 
 def receive_messages(sock):
     """Поток для получения сообщений от сервера"""
@@ -41,8 +43,10 @@ def send_messages(sock):
             break
 
 def start_client():
+    show_banner()
+
     host = config["server"]["host"]
-    port = config["server"]["port"]:
+    port = config["server"]["port"]
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
     try:
