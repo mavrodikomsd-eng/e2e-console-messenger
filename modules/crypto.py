@@ -29,4 +29,6 @@ def decrypt_message(encrypted_message):
         padded = cipher.decrypt(encrypted)
         return unpad(padded, AES.block_size).decode("utf-8")
     except Exception as e:
+        print(f"[ОШИБКА ДЕЦРИПТА] {type(e).__name__}: {e}")
+        print(f"[ОШИБКА ДЕЦРИПТА] Входные данные: {encrypted_message[:50]}...")
         return None

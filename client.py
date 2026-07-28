@@ -10,10 +10,8 @@ def receive_messages(sock):
     """Поток для получения сообщений от сервера"""
     while True:
         try:
-            # Получаем bytes из сокета
             encrypted_message_bytes = sock.recv(1024)
             if encrypted_message_bytes:
-                # Декодируем в строку для decrypt_message
                 encrypted_message = encrypted_message_bytes.decode("utf-8")
                 decrypted = decrypt_message(encrypted_message)
                 if decrypted:
@@ -33,13 +31,15 @@ def send_messages(sock):
             message = input(">>> ")
             if message:
                 encrypted = encrypt_message(message)
-                # encrypted уже строка, кодируем в bytes для отправки
+                print(f"[ДЕБАГ] Отправляю: {message}")
+                print(f"[ДЕБАГ] Зашифровано: {encrypted[:50]}...")
                 sock.send(encrypted.encode("utf-8"))
         except KeyboardInterrupt:
             print("\n[ВЫХОД] До свидания!")
             sock.close()
             sys.exit(0)
-        except:
+        except Exception as e:
+            print(f"[ОШИБКА ОТПРАВКИ] {e}")
             break
 
 def start_client():
@@ -57,17 +57,14 @@ def start_client():
         if not username:
             username = "Аноним"
         
-        # Отправляем имя пользователя
         sock.send(username.encode("utf-8"))
         print(f"\nДобро пожаловать, {username}!")
         print("Команды: /users (список), /clear (очистить), /help (справка), /exit (выход)\n")
         
-        # Запускаем поток для получения сообщений
         receive_thread = threading.Thread(target=receive_messages, args=(sock,))
         receive_thread.daemon = True
         receive_thread.start()
         
-        # Основной поток отправляет сообщения
         send_messages(sock)
     
     except ConnectionRefusedError:

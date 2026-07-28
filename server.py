@@ -1,5 +1,6 @@
 import socket
 import threading
+import traceback
 from datetime import datetime
 from modules.crypto import encrypt_message, decrypt_message
 from modules.config import config
