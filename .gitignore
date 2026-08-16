@@ -1,5 +1,9 @@
 # История сообщений
 messages.txt
+messages.log
+
+# Секретный ключ шифрования — НИКОГДА не коммить!
+secret.key
 
 # Python кэш
 __pycache__/

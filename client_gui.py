@@ -1,3 +1,5 @@
+import datetime
+
 import socket
 import threading
 import tkinter as tk
@@ -16,8 +18,8 @@ try:
     )
 except ImportError:
     config = {"server": {"host": "localhost", "port": 1301}}
-    def encrypt_message(m): return m
-    def decrypt_message(m): return m
+    def encrypt_message(m, aad=b""): return m
+    def decrypt_message(m, aad=b""): return m
     def send_frame(s, t, p): s.send(p.encode("utf-8"))
     def recv_frame(s): return (b"M", s.recv(1024))
     def set_tcp_nodelay(s): pass
@@ -56,10 +58,19 @@ class ChatClientGUI:
         # Чат
         self.chat_text = scrolledtext.ScrolledText(
             self.root, state="disabled", wrap=tk.WORD,
-            bg="#282a36", fg="#f8f8f2", font=("Courier", 11),
-            padx=8, pady=8, relief=tk.FLAT, borderwidth=0
+            bg="#282a36", fg="#f8f8f2", font=("Segoe UI", 11),
+            padx=10, pady=10, relief=tk.FLAT, borderwidth=0,
+            insertbackground="#f8f8f2"
         )
         self.chat_text.pack(padx=10, pady=(0, 10), fill=tk.BOTH, expand=True)
+
+        # Теги стилей
+        self.chat_text.tag_config("time", foreground="#6272a4", font=("Segoe UI", 9))
+        self.chat_text.tag_config("my_name", foreground="#50fa7b", font=("Segoe UI", 11, "bold"))
+        self.chat_text.tag_config("other_name", foreground="#ff79c6", font=("Segoe UI", 11, "bold"))
+        self.chat_text.tag_config("system", foreground="#8be9fd", font=("Segoe UI", 10, "italic"))
+        self.chat_text.tag_config("text", foreground="#f8f8f2", font=("Segoe UI", 11))
+        self.chat_text.tag_config("error", foreground="#ff5555", font=("Segoe UI", 10, "bold"))
 
         # Нижняя панель
         bottom = tk.Frame(self.root, bg="#1e1e2e")
@@ -122,26 +133,36 @@ class ChatClientGUI:
                     # Формат: имя + b'\x00' + шифротекст
                     sep = payload.find(b"\x00")
                     if sep == -1:
-                        self._append("[❌] Повреждённый кадр сообщения\n")
+                        time_str = datetime.datetime.now().strftime("%H:%M")
+                        self._append(f"[{time_str}] ", "time")
+                        self._append("[❌] Повреждённый кадр сообщения\n", "error")
                         continue
 
                     sender_name = payload[:sep].decode("utf-8", errors="replace")
                     encrypted = payload[sep + 1:].decode("utf-8", errors="replace")
 
-                    decrypted = decrypt_message(encrypted)
+                    # AAD = имя отправителя: подмена имени сломает проверку тега
+                    decrypted = decrypt_message(encrypted, aad=sender_name)
+                    time_str = datetime.datetime.now().strftime("%H:%M")
                     if decrypted:
-                        self._append(f"[{sender_name}]: {decrypted.rstrip()}\n")
+                        self._append(f"[{time_str}] ", "time")
+                        self._append(f"{sender_name}: ", "other_name")
+                        self._append(f"{decrypted.rstrip()}\n", "text")
                         try:
                             winsound.Beep(800, 200)
                         except:
                             pass
                     else:
-                        self._append(f"[{sender_name}]: (не удалось расшифровать)\n")
+                        self._append(f"[{time_str}] ", "time")
+                        self._append(f"{sender_name}: ", "other_name")
+                        self._append("(не удалось расшифровать — возможно, подменено имя)\n", "error")
 
                 elif frame_type == TYPE_COMMAND:
                     decrypted = decrypt_message(payload.decode("utf-8", errors="replace"))
                     if decrypted:
-                        self._append(f"{decrypted.rstrip()}\n")
+                        time_str = datetime.datetime.now().strftime("%H:%M")
+                        self._append(f"[{time_str}] ", "time")
+                        self._append(f"{decrypted.rstrip()}\n", "system")
 
             except Exception:
                 break
@@ -158,12 +179,29 @@ class ChatClientGUI:
             return
 
         try:
-            encrypted = encrypt_message(message)
-
             with self.lock:
-                if message.startswith("/"):
+                if message.startswith("/msg "):
+                    # Личное сообщение: /msg Имя текст
+                    parts = message.split(maxsplit=2)
+                    encrypted = ""
+                    if len(parts) >= 3:
+                        target_name, text = parts[1], parts[2]
+                        encrypted = encrypt_message(text, aad=self.username)
+                        send_frame(
+                            self.sock,
+                            TYPE_MESSAGE,
+                            self.username.encode("utf-8") + b"\x00" + target_name.encode("utf-8") + b"\x00" + encrypted.encode("utf-8"),
+                        )
+                        self._append(f"[Я] → {target_name}: {text}\n")
+                    else:
+                        self._append("[❌] Формат: /msg Имя текст\n", "error")
+                elif message.startswith("/"):
+                    # Команда — сервер расшифровывает сам, AAD не нужен
+                    encrypted = encrypt_message(message)
                     send_frame(self.sock, TYPE_COMMAND, encrypted)
                 else:
+                    # AAD = имя отправителя (привязка имени к шифротексту)
+                    encrypted = encrypt_message(message, aad=self.username)
                     # E2E: имя добавляет клиент, сервер не видит текст
                     send_frame(
                         self.sock,
@@ -178,10 +216,10 @@ class ChatClientGUI:
         except Exception as e:
             self._append(f"[❌ ОШИБКА] {e}\n")
 
-    def _append(self, text):
+    def _append(self, text, tag="text"):
         def _do():
             self.chat_text.configure(state="normal")
-            self.chat_text.insert(tk.END, text)
+            self.chat_text.insert(tk.END, text, tag)
             self.chat_text.see(tk.END)
             self.chat_text.configure(state="disabled")
         self.root.after(0, _do)

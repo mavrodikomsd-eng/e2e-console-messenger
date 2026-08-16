@@ -1,3 +1,4 @@
+import os
 import socket
 import threading
 import traceback
@@ -17,21 +18,33 @@ clients_lock = threading.Lock()
 
 
 def log_message(username, message_preview):
+    logging_cfg = config.get("logging", {})
+    if not logging_cfg.get("enabled", True):
+        return
+    log_path = logging_cfg.get("file", "messages.log")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] {username}: {message_preview}"
-    with open("messages.log", "a", encoding="utf-8") as f:
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    except Exception:
+        pass
+    with open(log_path, "a", encoding="utf-8") as f:
         f.write(log_entry + "\n")
 
 
-def broadcast_frame(frame_type, payload, sender_socket=None):
-    """Пересылает кадр ВСЕМ клиентам, кроме отправителя (E2E: содержимое не читаем)."""
+def broadcast_frame(frame_type, payload, sender_socket=None, target=None):
+    """Пересылает кадр ВСЕМ клиентам, кроме отправителя (E2E: содержимое не читаем).
+    Если задан target — только этому пользователю."""
     with clients_lock:
         for client_socket, client_address, username in clients:
-            if client_socket != sender_socket:
-                try:
-                    send_frame(client_socket, frame_type, payload)
-                except:
-                    pass
+            if client_socket == sender_socket:
+                continue
+            if target is not None and username != target:
+                continue
+            try:
+                send_frame(client_socket, frame_type, payload)
+            except Exception:
+                pass
 
 
 def handle_client(client_socket, client_address):
@@ -48,6 +61,11 @@ def handle_client(client_socket, client_address):
             username = f"User_{client_address[1]}"
 
         with clients_lock:
+            max_clients = config.get("server", {}).get("max_clients", 0)
+            if max_clients and len(clients) >= max_clients:
+                print(f"[ОТКАЗ] {username}: достигнут лимит {max_clients} клиентов")
+                client_socket.close()
+                return
             clients.append((client_socket, client_address, username))
 
         print(f"[ПОДКЛЮЧЕНИЕ] {username} подключился с {client_address}")
@@ -67,7 +85,23 @@ def handle_client(client_socket, client_address):
             if frame_type == TYPE_MESSAGE:
                 # ── E2E: сервер НЕ смотрит содержимое ──
                 # Формат: имя + \x00 + шифротекст
-                # Пересылаем как есть, просто логируем факт
+                # Личное: имя + \x00 + получатель + \x00 + шифротекст
+
+                # Личное сообщение: два разделителя — пересылаем только адресату
+                if payload.count(b"\x00") >= 2:
+                    try:
+                        _, target_bytes, _ = payload.split(b"\x00", 2)
+                        target_name = target_bytes.decode("utf-8").strip()
+                    except Exception:
+                        target_name = None
+
+                    if target_name:
+                        log_message(username, f"(личное для {target_name})")
+                        broadcast_frame(TYPE_MESSAGE, payload, client_socket, target=target_name)
+                        print(f"[{username}] -> {target_name}: (личное E2E сообщение)")
+                        continue
+
+                # Обычное сообщение: пересылаем всем
                 log_message(username, "(E2E сообщение)")
                 broadcast_frame(TYPE_MESSAGE, payload, client_socket)
                 print(f"[{username}]: (E2E сообщение → переслано)")
@@ -113,7 +147,7 @@ def handle_command(command, username, client_socket):
         send_frame(client_socket, TYPE_COMMAND, encrypt_message(response))
 
     elif command == "/help":
-        help_text = "\n[КОМАНДЫ]\n/users - список пользователей\n/clear - очистить экран\n/exit - выход\n/help - справка"
+        help_text = "\n[КОМАНДЫ]\n/users - список пользователей\n/msg Имя текст - личное сообщение\n/clear - очистить экран\n/exit - выход\n/help - справка"
         send_frame(client_socket, TYPE_COMMAND, encrypt_message(help_text))
 
     elif command == "/exit":

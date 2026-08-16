@@ -45,11 +45,13 @@ def receive_messages(sock):
                 sender_name = payload[:sep].decode("utf-8", errors="replace")
                 encrypted = payload[sep + 1:].decode("utf-8", errors="replace")
 
-                decrypted = decrypt_message(encrypted)
+                # AAD = имя отправителя: если имя в кадре подменили,
+                # расшифровка не пройдёт и появится предупреждение ниже
+                decrypted = decrypt_message(encrypted, aad=sender_name)
                 if decrypted:
                     safe_print(f"[{sender_name}]: {decrypted.rstrip()}")
                 else:
-                    safe_print(f"[{sender_name}]: (не удалось расшифровать)")
+                    safe_print(f"[{sender_name}]: (не удалось расшифровать — возможно, подменено имя)")
 
             elif frame_type == TYPE_COMMAND:
                 # Как M-кадр, но это системный/серверный ответ
@@ -78,13 +80,29 @@ def send_messages(sock, username):
                 break
 
             try:
-                encrypted = encrypt_message(message)
-
-                if message.startswith("/"):
-                    # Команда — сервер должен расшифровать сам
+                if message.startswith("/msg "):
+                    # Личное сообщение: /msg Имя текст
+                    parts = message.split(maxsplit=2)
+                    if len(parts) < 3:
+                        print("[ОШИБКА] Формат: /msg Имя текст")
+                        continue
+                    target_name, text = parts[1], parts[2]
+                    encrypted = encrypt_message(text, aad=username)
+                    # Формат личного M-кадра: имя + \0 + получатель + \0 + шифротекст
+                    send_frame(
+                        sock,
+                        TYPE_MESSAGE,
+                        username.encode("utf-8") + b"\x00" + target_name.encode("utf-8") + b"\x00" + encrypted.encode("utf-8"),
+                    )
+                    print(f"[Я] -> {target_name}: {text}")
+                elif message.startswith("/"):
+                    # Команда — сервер расшифровывает сам, AAD не нужен
+                    encrypted = encrypt_message(message)
                     send_frame(sock, TYPE_COMMAND, encrypted)
                 else:
                     # Сообщение — сервер НЕ должен видеть текст.
+                    # AAD = имя отправителя: имя привязывается к шифротексту
+                    encrypted = encrypt_message(message, aad=username)
                     # Клиент сам добавляет имя: name + \x00 + шифротекст
                     send_frame(sock, TYPE_MESSAGE, username.encode("utf-8") + b"\x00" + encrypted.encode("utf-8"))
                 print(f"[Я]: {message}")
@@ -126,7 +144,7 @@ def start_client():
         # Имя пользователя — фреймом M (сервер читает по фреймингу)
         send_frame(sock, TYPE_MESSAGE, username)
         print(f"\nДобро пожаловать, {username}!")
-        print("Команды: /users, /clear, /help, /exit\n")
+        print("Команды: /users, /msg Имя текст, /clear, /help, /exit\n")
 
         recv_thread = threading.Thread(target=receive_messages, args=(sock,), daemon=True)
         recv_thread.start()

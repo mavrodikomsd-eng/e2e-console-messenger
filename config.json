@@ -10,11 +10,6 @@
         "file": "data/logs/messages.log"
     },
 
-    "crypto": {
-        "algorithm": "AES-256-GCM",
-        "key": "wOatnYXc9eS+JOMYEPuPTf9o82rT56fxgigXsl4h0kY="
-    },
-
     "client": {
         "auto_reconnect": true
     }

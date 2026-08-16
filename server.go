@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -48,6 +49,8 @@ const (
 	typeMessage = byte('M') // сообщение: имя + \x00 + шифротекст (сервер не читает)
 	typeCommand = byte('C') // команда/системный ответ (зашифровано)
 	headerSize  = 5         // 1 (тип) + 4 (длина)
+
+	keyFile = "secret.key"
 )
 
 func logMessage(username, messagePreview string) {
@@ -185,6 +188,19 @@ func broadcastFrame(frameType byte, payload []byte, senderConn net.Conn) {
 	}
 }
 
+// sendToUsername доставляет кадр только клиенту с указанным именем.
+func sendToUsername(frameType byte, payload []byte, senderConn net.Conn, target string) {
+	clientsMutex.Lock()
+	defer clientsMutex.Unlock()
+
+	for _, client := range clients {
+		if client.conn != senderConn && client.username == target {
+			sendFrame(client.conn, frameType, payload)
+			return
+		}
+	}
+}
+
 func handleClient(conn net.Conn, address string) {
 	defer conn.Close()
 	var username string
@@ -220,7 +236,16 @@ func handleClient(conn net.Conn, address string) {
 
 		if frameType == typeMessage {
 			// ── E2E: сервер НЕ смотрит содержимое ──
-			// Формат: имя + \x00 + шифротекст. Пересылаем как есть.
+			// Обычное: имя + \x00 + шифротекст. Пересылаем как есть.
+			// Личное:  имя + \x00 + получатель + \x00 + шифротекст → только адресату.
+			parts := bytes.Split(payload, []byte{0})
+			if len(parts) >= 3 && len(parts[1]) > 0 {
+				target := strings.TrimSpace(string(parts[1]))
+				logMessage(username, "(личное для "+target+")")
+				sendToUsername(typeMessage, payload, conn, target)
+				fmt.Printf("[%s] -> %s: (личное E2E сообщение)\n", username, target)
+				continue
+			}
 			logMessage(username, "(E2E сообщение)")
 			broadcastFrame(typeMessage, payload, conn)
 			fmt.Printf("[%s]: (E2E сообщение → переслано)\n", username)
@@ -318,15 +343,46 @@ func startServer(cfg *Config) {
 	}
 }
 
-func main() {
-	cfg := loadConfig("configs.json")
+// loadOrCreateKey возвращает AES-256 ключ в порядке приоритета:
+//  1. файл secret.key        — основной источник секрета
+//  2. конфиг (миграция со старой версии) — копируется в secret.key
+//  3. генерация нового ключа при полном отсутствии секрета
+func loadOrCreateKey(cfg *Config) []byte {
+	// 1) Секретный файл
+	if data, err := os.ReadFile(keyFile); err == nil {
+		key, derr := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data)))
+		if derr == nil && len(key) == keySize {
+			return key
+		}
+	}
 
-	key, err := base64.StdEncoding.DecodeString(cfg.Crypto.Key)
-	if err != nil || len(key) != keySize {
-		fmt.Printf("Ошибка: ключ должен быть base64 из %d байт (AES-256). Сгенерируй: openssl rand -base64 32\n", keySize)
+	// 2) Миграция из configs.json (свойство crypto.key)
+	if cfg.Crypto.Key != "" {
+		if key, derr := base64.StdEncoding.DecodeString(cfg.Crypto.Key); derr == nil && len(key) == keySize {
+			_ = os.WriteFile(keyFile, []byte(base64.StdEncoding.EncodeToString(key)), 0600)
+			fmt.Printf("[ВНИМАНИЕ] Ключ перенесён из configs.json в %s\n", keyFile)
+			return key
+		}
+	}
+
+	// 3) Генерация нового ключа
+	key := make([]byte, keySize)
+	if _, err := rand.Read(key); err != nil {
+		fmt.Printf("Ошибка генерации ключа: %v\n", err)
 		os.Exit(1)
 	}
-	encryptKey = key
+	if err := os.WriteFile(keyFile, []byte(base64.StdEncoding.EncodeToString(key)), 0600); err != nil {
+		fmt.Printf("Ошибка записи %s: %v\n", keyFile, err)
+		os.Exit(1)
+	}
+	fmt.Printf("[СОЗДАНИЕ] Ключ AES-256 сгенерирован и сохранён в %s (поделись им с участниками чата)\n", keyFile)
+
+	return key
+}
+
+func main() {
+	cfg := loadConfig("configs.json")
+	encryptKey = loadOrCreateKey(cfg)
 
 	startServer(cfg)
 }
