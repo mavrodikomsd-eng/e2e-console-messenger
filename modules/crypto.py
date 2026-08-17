@@ -1,8 +1,10 @@
 import base64
+import hashlib
 import json
 import os
 import sys
 from Crypto.Cipher import AES
+from Crypto.Protocol import DH
 
 KEY_FILE = "secret.key"
 CONFIG_FILE = "config.json"
@@ -84,55 +86,80 @@ def _load_key() -> bytes:
 KEY = _load_key()
 
 
-def encrypt_message(plaintext: str, aad: bytes | str = b"") -> str:
-    """
-    Аутентифицированное шифрование AES-256-GCM.
+def encrypt_message(plaintext, aad=b""):
+    return _gcm_encrypt(KEY, plaintext, aad)
 
-    aad (Additional Authenticated Data) — открытые данные, которые
-    ПРИВЯЗАНЫ к шифротексту: любое их изменение ломает проверку тега.
-    Используй aad=имя отправителя, чтобы подмена имени в кадре
-    не проходила незамеченной.
 
-    Возвращает base64(nonce + ciphertext + tag).
-    """
+def decrypt_message(encoded, aad=b""):
+    return _gcm_decrypt(KEY, encoded, aad)
+
+
+def _gcm_encrypt(key, plaintext, aad=b""):
     if isinstance(plaintext, str):
         plaintext = plaintext.encode("utf-8")
     if isinstance(aad, str):
         aad = aad.encode("utf-8")
-
     nonce = os.urandom(NONCE_SIZE)
-    cipher = AES.new(KEY, AES.MODE_GCM, nonce=nonce)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
     if aad:
-        cipher.update(aad)  # привязка имени отправителя к шифротексту
+        cipher.update(aad)
     ciphertext, tag = cipher.encrypt_and_digest(plaintext)
-
-    payload = nonce + ciphertext + tag
-    return base64.b64encode(payload).decode("utf-8")
+    return base64.b64encode(nonce + ciphertext + tag).decode("utf-8")
 
 
-def decrypt_message(encoded: str, aad: bytes | str = b"") -> str | None:
-    """
-    Расшифровка и проверка подлинности AES-256-GCM.
-    aad должен совпадать с тем, что был передан при шифровании.
-
-    Возвращает None при ошибке (битый ciphertext, подмена/изменение
-    aad, неверный ключ).
-    """
+def _gcm_decrypt(key, encoded, aad=b""):
     try:
         payload = base64.b64decode(encoded)
-
         nonce = payload[:NONCE_SIZE]
         tag = payload[-TAG_SIZE:]
         ciphertext = payload[NONCE_SIZE:-TAG_SIZE]
         if isinstance(aad, str):
             aad = aad.encode("utf-8")
-
-        cipher = AES.new(KEY, AES.MODE_GCM, nonce=nonce)
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
         if aad:
-            cipher.update(aad)  # должно совпадать с AAD при шифровании
-        plaintext = cipher.decrypt_and_verify(ciphertext, tag)
-        return plaintext.decode("utf-8")
-
+            cipher.update(aad)
+        return cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")
     except Exception:
-        # Любая ошибка расшифровки = сообщение повреждено/подменено/не для нас
         return None
+
+
+IDENTITY_FILE = "identity.key"
+
+
+def load_or_create_identity():
+    path = os.environ.get("MESH_IDENTITY_FILE", IDENTITY_FILE)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            parts = f.read().split()
+        if len(parts) == 2:
+            return parts[0], parts[1]
+    seed = os.urandom(KEY_SIZE)
+    priv = DH.import_x25519_private_key(seed)
+    pub = priv.public_key().export_key(format="raw")
+    seed_b64 = base64.b64encode(seed).decode("ascii")
+    pub_b64 = base64.b64encode(pub).decode("ascii")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{seed_b64} {pub_b64}\n")
+    return seed_b64, pub_b64
+
+
+def _derive_key(our_seed_b64, peer_pub_b64):
+    seed = base64.b64decode(our_seed_b64)
+    peer_pub = base64.b64decode(peer_pub_b64)
+    priv = DH.import_x25519_private_key(seed)
+    pub = DH.import_x25519_public_key(peer_pub)
+
+    def _kdf(shared):
+        return hashlib.sha256(shared).digest()
+
+    return DH.key_agreement(static_priv=priv, static_pub=pub, kdf=_kdf)
+
+
+def encrypt_to_peer(plaintext, peer_pub_b64, self_pub_b64, our_seed_b64):
+    key = _derive_key(our_seed_b64, peer_pub_b64)
+    return _gcm_encrypt(key, plaintext, aad=self_pub_b64)
+
+
+def decrypt_from_peer(encoded, sender_pub_b64, our_seed_b64):
+    key = _derive_key(our_seed_b64, sender_pub_b64)
+    return _gcm_decrypt(key, encoded, aad=sender_pub_b64)

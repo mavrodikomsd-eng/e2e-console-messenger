@@ -31,6 +31,8 @@ type Client struct {
 	conn     net.Conn
 	address  string
 	username string
+	room     string
+	pubkey   string
 }
 
 var (
@@ -46,9 +48,11 @@ const (
 
 	maxMessageSize = 1 << 20 // 1 МБ
 
-	typeMessage = byte('M') // сообщение: имя + \x00 + шифротекст (сервер не читает)
-	typeCommand = byte('C') // команда/системный ответ (зашифровано)
-	headerSize  = 5         // 1 (тип) + 4 (длина)
+	typeMessage  = byte('M')
+	typeCommand  = byte('C')
+	typeFile     = byte('F')
+	typeRegister = byte('R')
+	headerSize   = 5
 
 	keyFile = "secret.key"
 )
@@ -201,6 +205,39 @@ func sendToUsername(frameType byte, payload []byte, senderConn net.Conn, target 
 	}
 }
 
+func broadcastToRoom(frameType byte, payload []byte, senderConn net.Conn, room string) {
+	clientsMutex.Lock()
+	defer clientsMutex.Unlock()
+	for _, client := range clients {
+		if client.conn != senderConn && client.room == room {
+			sendFrame(client.conn, frameType, payload)
+		}
+	}
+}
+
+func findClient(conn net.Conn) *Client {
+	clientsMutex.Lock()
+	defer clientsMutex.Unlock()
+	for _, c := range clients {
+		if c.conn == conn {
+			return c
+		}
+	}
+	return nil
+}
+
+func pubKeysTable() string {
+	clientsMutex.Lock()
+	defer clientsMutex.Unlock()
+	var parts []string
+	for _, c := range clients {
+		if c.pubkey != "" {
+			parts = append(parts, c.username+":"+c.pubkey)
+		}
+	}
+	return strings.Join(parts, ";")
+}
+
 func handleClient(conn net.Conn, address string) {
 	defer conn.Close()
 	var username string
@@ -219,14 +256,13 @@ func handleClient(conn net.Conn, address string) {
 	}
 
 	clientsMutex.Lock()
-	clients = append(clients, &Client{conn: conn, address: address, username: username})
+	clients = append(clients, &Client{conn: conn, address: address, username: username, room: "main"})
 	clientsMutex.Unlock()
 
-	fmt.Printf("[ПОДКЛЮЧЕНИЕ] %s подключился с %s\n", username, address)
+	fmt.Printf("[ПОДКЛЮЧЕНИЕ] %s подключился с %s (комната: main)\n", username, address)
 
-	// Системное сообщение о подключении — зашифровано (тип C)
 	joinText := fmt.Sprintf("\n[СИСТЕМА] %s присоединился к чату", username)
-	broadcastFrame(typeCommand, []byte(encryptMessage(joinText)), conn)
+	broadcastToRoom(typeCommand, []byte(encryptMessage(joinText)), conn, "main")
 
 	for {
 		frameType, payload, err := recvFrame(conn)
@@ -234,35 +270,54 @@ func handleClient(conn net.Conn, address string) {
 			break
 		}
 
+		room := "main"
+		self := findClient(conn)
+		if self != nil {
+			room = self.room
+		}
+
 		if frameType == typeMessage {
-			// ── E2E: сервер НЕ смотрит содержимое ──
-			// Обычное: имя + \x00 + шифротекст. Пересылаем как есть.
-			// Личное:  имя + \x00 + получатель + \x00 + шифротекст → только адресату.
 			parts := bytes.Split(payload, []byte{0})
 			if len(parts) >= 3 && len(parts[1]) > 0 {
 				target := strings.TrimSpace(string(parts[1]))
 				logMessage(username, "(личное для "+target+")")
 				sendToUsername(typeMessage, payload, conn, target)
-				fmt.Printf("[%s] -> %s: (личное E2E сообщение)\n", username, target)
 				continue
 			}
-			logMessage(username, "(E2E сообщение)")
-			broadcastFrame(typeMessage, payload, conn)
-			fmt.Printf("[%s]: (E2E сообщение → переслано)\n", username)
+			logMessage(username, "(E2E сообщение в "+room+")")
+			broadcastToRoom(typeMessage, payload, conn, room)
+			fmt.Printf("[%s]: (E2E сообщение → комната %s)\n", username, room)
+		} else if frameType == typeFile {
+			logMessage(username, "(файл)")
+			broadcastToRoom(typeFile, payload, conn, room)
+			fmt.Printf("[%s]: (файл → комната %s)\n", username, room)
 		} else if frameType == typeCommand {
-			// Команду расшифровываем (служебная информация)
 			decrypted, err := decryptMessage(string(payload))
 			if err != nil {
 				fmt.Printf("[!!] %s отправил невалидную команду\n", username)
 				continue
 			}
-			handleCommand(decrypted, username, conn)
+			handleCommand(decrypted, findClient(conn))
+		} else if frameType == typeRegister {
+			parts := bytes.Split(payload, []byte{0})
+			if len(parts) >= 2 {
+				nm := strings.TrimSpace(string(parts[0]))
+				pk := string(parts[1])
+				if self != nil {
+					self.pubkey = pk
+				}
+				table := pubKeysTable()
+				sendFrameString(conn, typeCommand, encryptMessage("[ПУБКЛЮЧИ]" + table))
+				broadcastFrame(typeCommand, []byte(encryptMessage("[НОВЫЙ]" + nm + ":" + pk)), conn)
+			}
 		}
 	}
 
 	clientsMutex.Lock()
+	room := "main"
 	for i, c := range clients {
 		if c.conn == conn {
+			room = c.room
 			clients = append(clients[:i], clients[i+1:]...)
 			break
 		}
@@ -270,34 +325,105 @@ func handleClient(conn net.Conn, address string) {
 	clientsMutex.Unlock()
 
 	leaveText := fmt.Sprintf("\n[СИСТЕМА] %s покинул чат", username)
-	broadcastFrame(typeCommand, []byte(encryptMessage(leaveText)), nil)
+	broadcastToRoom(typeCommand, []byte(encryptMessage(leaveText)), nil, room)
 	fmt.Printf("[ОТКЛЮЧЕНИЕ] %s отключился\n", username)
 }
 
-func handleCommand(command, username string, conn net.Conn) {
+func handleCommand(command string, self *Client) {
+	if self == nil {
+		return
+	}
+	conn := self.conn
 	command = strings.TrimSpace(command)
 
-	switch command {
-	case "/users":
+	switch {
+	case command == "/users":
 		clientsMutex.Lock()
-		userList := make([]string, len(clients))
-		for i, c := range clients {
-			userList[i] = c.username
+		var names []string
+		for _, c := range clients {
+			if c.room == self.room {
+				names = append(names, c.username)
+			}
 		}
 		clientsMutex.Unlock()
-
-		response := fmt.Sprintf("\n[ПОЛЬЗОВАТЕЛИ] Онлайн (%d): %s", len(userList), strings.Join(userList, ", "))
+		response := fmt.Sprintf("\n[ПОЛЬЗОВАТЕЛИ] Комната %s (%d): %s", self.room, len(names), strings.Join(names, ", "))
 		sendFrameString(conn, typeCommand, encryptMessage(response))
 
-	case "/clear":
-		response := strings.Repeat("\n", 50)
-		sendFrameString(conn, typeCommand, encryptMessage(response))
+	case command == "/rooms":
+		clientsMutex.Lock()
+		counts := map[string]int{}
+		for _, c := range clients {
+			counts[c.room]++
+		}
+		clientsMutex.Unlock()
+		var parts []string
+		for r, n := range counts {
+			parts = append(parts, fmt.Sprintf("%s(%d)", r, n))
+		}
+		sendFrameString(conn, typeCommand, encryptMessage("\n[КОМНАТЫ] "+strings.Join(parts, ", ")))
 
-	case "/help":
-		helpText := "\n[КОМАНДЫ]\n/users - список пользователей\n/clear - очистить экран\n/exit - выход\n/help - справка"
-		sendFrameString(conn, typeCommand, encryptMessage(helpText))
+	case strings.HasPrefix(command, "/join "):
+		room := strings.TrimSpace(strings.TrimPrefix(command, "/join "))
+		if room == "" {
+			break
+		}
+		self.room = room
+		sendFrameString(conn, typeCommand, encryptMessage("\n[КОМНАТА] Вы в комнате: "+room))
+		fmt.Printf("[%s] перешёл в комнату %s\n", self.username, room)
 
-	case "/exit":
+	case command == "/leave":
+		self.room = "main"
+		sendFrameString(conn, typeCommand, encryptMessage("\n[КОМНАТА] Вы вернулись в main"))
+
+	case command == "/time":
+		sendFrameString(conn, typeCommand, encryptMessage("\n[ВРЕМЯ] "+time.Now().Format("2006-01-02 15:04:05")))
+
+	case command == "/ping":
+		sendFrameString(conn, typeCommand, encryptMessage("\n[PING] pong"))
+
+	case command == "/status":
+		clientsMutex.Lock()
+		total := len(clients)
+		clientsMutex.Unlock()
+		sendFrameString(conn, typeCommand, encryptMessage(fmt.Sprintf("\n[СТАТУС] Онлайн: %d, комната: %s", total, self.room)))
+
+	case strings.HasPrefix(command, "/pubkey "):
+		name := strings.TrimSpace(strings.TrimPrefix(command, "/pubkey "))
+		pub := ""
+		clientsMutex.Lock()
+		for _, c := range clients {
+			if c.username == name {
+				pub = c.pubkey
+				break
+			}
+		}
+		clientsMutex.Unlock()
+		if pub == "" {
+			pub = "ERR"
+		}
+		sendFrameString(conn, typeCommand, encryptMessage("[RESP]" + pub))
+
+	case command == "/roommembers":
+		clientsMutex.Lock()
+		var parts []string
+		for _, c := range clients {
+			if c.room == self.room && c.pubkey != "" {
+				parts = append(parts, c.username+":"+c.pubkey)
+			}
+		}
+		clientsMutex.Unlock()
+		sendFrameString(conn, typeCommand, encryptMessage("[RESP]" + strings.Join(parts, ";")))
+
+	case command == "/about":
+		sendFrameString(conn, typeCommand, encryptMessage("\nMeshMessenger v0.2\nЗащищённый мессенджер с E2E-шифрованием.\nОсновной сервер: Go."))
+
+	case command == "/clear":
+		sendFrameString(conn, typeCommand, encryptMessage(strings.Repeat("\n", 50)))
+
+	case command == "/help":
+		sendFrameString(conn, typeCommand, encryptMessage("\n[КОМАНДЫ]\n/users /rooms - списки\n/join <комната> /leave\n/file <путь>\n/msg Имя текст - личное\n/time /status /ping /about\n/clear /exit /help"))
+
+	case command == "/exit":
 		conn.Close()
 	}
 }

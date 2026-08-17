@@ -11,6 +11,8 @@ from modules.protocol import (
     set_tcp_nodelay,
     TYPE_MESSAGE,
     TYPE_COMMAND,
+    TYPE_FILE,
+    TYPE_REGISTER,
 )
 
 clients = []  # (socket, address, username)
@@ -36,7 +38,7 @@ def broadcast_frame(frame_type, payload, sender_socket=None, target=None):
     """Пересылает кадр ВСЕМ клиентам, кроме отправителя (E2E: содержимое не читаем).
     Если задан target — только этому пользователю."""
     with clients_lock:
-        for client_socket, client_address, username in clients:
+        for client_socket, client_address, username, _pk in clients:
             if client_socket == sender_socket:
                 continue
             if target is not None and username != target:
@@ -45,6 +47,15 @@ def broadcast_frame(frame_type, payload, sender_socket=None, target=None):
                 send_frame(client_socket, frame_type, payload)
             except Exception:
                 pass
+
+
+def pubkeys_table():
+    with clients_lock:
+        parts = []
+        for _, _, name, pk in clients:
+            if pk:
+                parts.append(name + ":" + pk)
+    return ";".join(parts)
 
 
 def handle_client(client_socket, client_address):
@@ -66,7 +77,7 @@ def handle_client(client_socket, client_address):
                 print(f"[ОТКАЗ] {username}: достигнут лимит {max_clients} клиентов")
                 client_socket.close()
                 return
-            clients.append((client_socket, client_address, username))
+            clients.append((client_socket, client_address, username, ""))
 
         print(f"[ПОДКЛЮЧЕНИЕ] {username} подключился с {client_address}")
 
@@ -114,6 +125,29 @@ def handle_client(client_socket, client_address):
                     continue
                 handle_command(decrypted, username, client_socket)
 
+            elif frame_type == TYPE_FILE:
+                _p = payload.split(b"\x00")
+                _target = ""
+                if len(_p) >= 2:
+                    _target = _p[1].decode("utf-8", errors="replace").strip()
+                if _target:
+                    broadcast_frame(TYPE_FILE, payload, client_socket, target=_target)
+                else:
+                    broadcast_frame(TYPE_FILE, payload, client_socket)
+
+            elif frame_type == TYPE_REGISTER:
+                _p = payload.split(b"\x00")
+                if len(_p) >= 2:
+                    pk = _p[1].decode("utf-8", errors="replace")
+                    with clients_lock:
+                        for i, entry in enumerate(clients):
+                            if entry[0] == client_socket:
+                                clients[i] = (entry[0], entry[1], entry[2], pk)
+                                break
+                    table = pubkeys_table()
+                    send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ПУБКЛЮЧИ]" + table))
+                    broadcast_frame(TYPE_COMMAND, encrypt_message("[НОВЫЙ]" + username + ":" + pk), client_socket)
+
     except Exception:
         print("\n========== TRACEBACK ==========")
         traceback.print_exc()
@@ -122,7 +156,7 @@ def handle_client(client_socket, client_address):
     finally:
         if username:
             with clients_lock:
-                clients[:] = [(s, a, u) for s, a, u in clients if s != client_socket]
+                clients[:] = [(s, a, u, pk) for s, a, u, pk in clients if s != client_socket]
             leave_text = f"\n[СИСТЕМА] {username} покинул чат"
             broadcast_frame(TYPE_COMMAND, encrypt_message(leave_text))
             print(f"[ОТКЛЮЧЕНИЕ] {username} отключился")
@@ -138,7 +172,7 @@ def handle_command(command, username, client_socket):
 
     if command == "/users":
         with clients_lock:
-            user_list = [u for _, _, u in clients]
+            user_list = [u for _, _, u, _pk in clients]
         response = f"\n[ПОЛЬЗОВАТЕЛИ] Онлайн ({len(user_list)}): {', '.join(user_list)}"
         send_frame(client_socket, TYPE_COMMAND, encrypt_message(response))
 
@@ -149,6 +183,24 @@ def handle_command(command, username, client_socket):
     elif command == "/help":
         help_text = "\n[КОМАНДЫ]\n/users - список пользователей\n/msg Имя текст - личное сообщение\n/clear - очистить экран\n/exit - выход\n/help - справка"
         send_frame(client_socket, TYPE_COMMAND, encrypt_message(help_text))
+
+    elif command.startswith("/pubkey "):
+        name = command.split(maxsplit=1)[1].strip()
+        pub = ""
+        with clients_lock:
+            for _, _, n, pk in clients:
+                if n == name:
+                    pub = pk
+                    break
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("[RESP]" + (pub or "ERR")))
+
+    elif command == "/roommembers":
+        parts = []
+        with clients_lock:
+            for _, _, name, pk in clients:
+                if pk:
+                    parts.append(name + ":" + pk)
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("[RESP]" + ";".join(parts)))
 
     elif command == "/exit":
         client_socket.close()
