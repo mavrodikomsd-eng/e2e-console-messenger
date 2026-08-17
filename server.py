@@ -1,3 +1,4 @@
+import hashlib
 import os
 import socket
 import threading
@@ -15,8 +16,18 @@ from modules.protocol import (
     TYPE_REGISTER,
 )
 
-clients = []  # (socket, address, username)
+clients = []
 clients_lock = threading.Lock()
+rooms = {}
+
+
+class Client:
+    def __init__(self, sock, addr, name):
+        self.sock = sock
+        self.addr = addr
+        self.name = name
+        self.pub = ""
+        self.room = "main"
 
 
 def log_message(username, message_preview):
@@ -34,34 +45,46 @@ def log_message(username, message_preview):
         f.write(log_entry + "\n")
 
 
-def broadcast_frame(frame_type, payload, sender_socket=None, target=None):
-    """Пересылает кадр ВСЕМ клиентам, кроме отправителя (E2E: содержимое не читаем).
-    Если задан target — только этому пользователю."""
+def find_client(sock):
     with clients_lock:
-        for client_socket, client_address, username, _pk in clients:
-            if client_socket == sender_socket:
+        for c in clients:
+            if c.sock == sock:
+                return c
+    return None
+
+
+def broadcast_frame(frame_type, payload, sender_socket=None, target=None):
+    with clients_lock:
+        for c in clients:
+            if c.sock == sender_socket:
                 continue
-            if target is not None and username != target:
+            if target is not None and c.name != target:
                 continue
             try:
-                send_frame(client_socket, frame_type, payload)
+                send_frame(c.sock, frame_type, payload)
             except Exception:
                 pass
 
 
+def broadcast_to_room(frame_type, payload, sender, room):
+    with clients_lock:
+        for c in clients:
+            if c is not sender and c.room == room:
+                try:
+                    send_frame(c.sock, frame_type, payload)
+                except Exception:
+                    pass
+
+
 def pubkeys_table():
     with clients_lock:
-        parts = []
-        for _, _, name, pk in clients:
-            if pk:
-                parts.append(name + ":" + pk)
-    return ";".join(parts)
+        return ";".join(f"{c.name}:{c.pub}" for c in clients if c.pub)
 
 
 def handle_client(client_socket, client_address):
     username = None
+    client = None
     try:
-        # Первый кадр — имя пользователя (без шифрования)
         first = recv_frame(client_socket)
         if first is None:
             client_socket.close()
@@ -72,19 +95,22 @@ def handle_client(client_socket, client_address):
             username = f"User_{client_address[1]}"
 
         with clients_lock:
-            max_clients = config.get("server", {}).get("max_clients", 0)
-            if max_clients and len(clients) >= max_clients:
-                print(f"[ОТКАЗ] {username}: достигнут лимит {max_clients} клиентов")
+            if any(c.name == username for c in clients):
+                send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Имя уже занято, выбери другое"))
                 client_socket.close()
                 return
-            clients.append((client_socket, client_address, username, ""))
+            max_clients = config.get("server", {}).get("max_clients", 0)
+            if max_clients and len(clients) >= max_clients:
+                send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Достигнут лимит клиентов"))
+                client_socket.close()
+                return
+            client = Client(client_socket, client_address, username)
+            clients.append(client)
 
-        print(f"[ПОДКЛЮЧЕНИЕ] {username} подключился с {client_address}")
+        print(f"[ПОДКЛЮЧЕНИЕ] {username} подключился с {client_address} (комната: main)")
 
-        # Системное сообщение о подключении шлём типом C (зашифровано)
-        # — кто угодно может прочитать (все знают ключ)
         join_text = f"\n[СИСТЕМА] {username} присоединился к чату"
-        broadcast_frame(TYPE_COMMAND, encrypt_message(join_text), client_socket)
+        broadcast_to_room(TYPE_COMMAND, encrypt_message(join_text), client, "main")
 
         while True:
             frame = recv_frame(client_socket)
@@ -94,36 +120,27 @@ def handle_client(client_socket, client_address):
             frame_type, payload = frame
 
             if frame_type == TYPE_MESSAGE:
-                # ── E2E: сервер НЕ смотрит содержимое ──
-                # Формат: имя + \x00 + шифротекст
-                # Личное: имя + \x00 + получатель + \x00 + шифротекст
-
-                # Личное сообщение: два разделителя — пересылаем только адресату
                 if payload.count(b"\x00") >= 2:
                     try:
                         _, target_bytes, _ = payload.split(b"\x00", 2)
-                        target_name = target_bytes.decode("utf-8").strip()
+                        target_name = target_bytes.decode("utf-8", errors="replace").strip()
                     except Exception:
                         target_name = None
-
                     if target_name:
                         log_message(username, f"(личное для {target_name})")
                         broadcast_frame(TYPE_MESSAGE, payload, client_socket, target=target_name)
                         print(f"[{username}] -> {target_name}: (личное E2E сообщение)")
                         continue
-
-                # Обычное сообщение: пересылаем всем
                 log_message(username, "(E2E сообщение)")
-                broadcast_frame(TYPE_MESSAGE, payload, client_socket)
-                print(f"[{username}]: (E2E сообщение → переслано)")
+                broadcast_to_room(TYPE_MESSAGE, payload, client, client.room)
+                print(f"[{username}]: (E2E сообщение → комната {client.room})")
 
             elif frame_type == TYPE_COMMAND:
-                # Команду расшифровываем (это служебные данные)
                 decrypted = decrypt_message(payload.decode("utf-8", errors="replace"))
                 if decrypted is None:
                     print(f"[!!] {username} отправил невалидную команду")
                     continue
-                handle_command(decrypted, username, client_socket)
+                handle_command(decrypted, find_client(client_socket))
 
             elif frame_type == TYPE_FILE:
                 _p = payload.split(b"\x00")
@@ -133,17 +150,14 @@ def handle_client(client_socket, client_address):
                 if _target:
                     broadcast_frame(TYPE_FILE, payload, client_socket, target=_target)
                 else:
-                    broadcast_frame(TYPE_FILE, payload, client_socket)
+                    broadcast_to_room(TYPE_FILE, payload, client, client.room)
 
             elif frame_type == TYPE_REGISTER:
                 _p = payload.split(b"\x00")
                 if len(_p) >= 2:
                     pk = _p[1].decode("utf-8", errors="replace")
-                    with clients_lock:
-                        for i, entry in enumerate(clients):
-                            if entry[0] == client_socket:
-                                clients[i] = (entry[0], entry[1], entry[2], pk)
-                                break
+                    if client is not None:
+                        client.pub = pk
                     table = pubkeys_table()
                     send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ПУБКЛЮЧИ]" + table))
                     broadcast_frame(TYPE_COMMAND, encrypt_message("[НОВЫЙ]" + username + ":" + pk), client_socket)
@@ -155,52 +169,112 @@ def handle_client(client_socket, client_address):
 
     finally:
         if username:
+            room = "main"
             with clients_lock:
-                clients[:] = [(s, a, u, pk) for s, a, u, pk in clients if s != client_socket]
+                if client in clients:
+                    clients.remove(client)
+                    room = client.room
             leave_text = f"\n[СИСТЕМА] {username} покинул чат"
-            broadcast_frame(TYPE_COMMAND, encrypt_message(leave_text))
+            broadcast_to_room(TYPE_COMMAND, encrypt_message(leave_text), client, room)
             print(f"[ОТКЛЮЧЕНИЕ] {username} отключился")
         try:
             client_socket.close()
-        except:
+        except Exception:
             pass
 
 
-def handle_command(command, username, client_socket):
-    """Обработка команд от клиента (ответ шлём типом C, зашифрованный)."""
+def handle_command(command, client):
+    if client is None:
+        return
+    client_socket = client.sock
     command = command.strip()
 
     if command == "/users":
         with clients_lock:
-            user_list = [u for _, _, u, _pk in clients]
-        response = f"\n[ПОЛЬЗОВАТЕЛИ] Онлайн ({len(user_list)}): {', '.join(user_list)}"
+            names = [c.name for c in clients if c.room == client.room]
+        response = f"\n[ПОЛЬЗОВАТЕЛИ] Комната {client.room} ({len(names)}): {', '.join(names)}"
         send_frame(client_socket, TYPE_COMMAND, encrypt_message(response))
 
-    elif command == "/clear":
-        response = "\n" * 50
+    elif command == "/rooms":
+        with clients_lock:
+            parts = []
+            for rname, pwd in rooms.items():
+                mark = "🔒" if pwd else "открыта"
+                parts.append(f"{rname}({mark})")
+        response = "\n[КОМНАТЫ] " + ", ".join(parts)
         send_frame(client_socket, TYPE_COMMAND, encrypt_message(response))
 
-    elif command == "/help":
-        help_text = "\n[КОМАНДЫ]\n/users - список пользователей\n/msg Имя текст - личное сообщение\n/clear - очистить экран\n/exit - выход\n/help - справка"
-        send_frame(client_socket, TYPE_COMMAND, encrypt_message(help_text))
+    elif command.startswith("/createroom "):
+        parts = command.split(maxsplit=2)
+        rname = parts[1].strip() if len(parts) > 1 else ""
+        pwd = parts[2] if len(parts) > 2 else ""
+        if not rname:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Формат: /createroom <название> <пароль>"))
+            return
+        with clients_lock:
+            if rname in rooms:
+                send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Комната уже существует: " + rname))
+                return
+            rooms[rname] = hashlib.sha256(pwd.encode("utf-8")).hexdigest() if pwd else ""
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message(f"\n[КОМНАТА] Создана комната {rname}"))
+
+    elif command.startswith("/join "):
+        parts = command.split(maxsplit=2)
+        rname = parts[1].strip() if len(parts) > 1 else ""
+        pwd = parts[2] if len(parts) > 2 else ""
+        if not rname:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Формат: /join <комната> [пароль]"))
+            return
+        with clients_lock:
+            if rname in rooms:
+                if rooms[rname] and hashlib.sha256(pwd.encode("utf-8")).hexdigest() != rooms[rname]:
+                    send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Неверный пароль для " + rname))
+                    return
+            else:
+                rooms[rname] = ""
+            client.room = rname
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("\n[КОМНАТА] Вы в комнате: " + rname))
+        print(f"[{client.name}] перешёл в комнату {rname}")
+
+    elif command == "/leave":
+        client.room = "main"
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("\n[КОМНАТА] Вы вернулись в main"))
+
+    elif command == "/roommembers":
+        with clients_lock:
+            parts = [f"{c.name}:{c.pub}" for c in clients if c.room == client.room and c.pub]
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("[RESP]" + ";".join(parts)))
 
     elif command.startswith("/pubkey "):
         name = command.split(maxsplit=1)[1].strip()
         pub = ""
         with clients_lock:
-            for _, _, n, pk in clients:
-                if n == name:
-                    pub = pk
+            for c in clients:
+                if c.name == name:
+                    pub = c.pub
                     break
         send_frame(client_socket, TYPE_COMMAND, encrypt_message("[RESP]" + (pub or "ERR")))
 
-    elif command == "/roommembers":
-        parts = []
+    elif command == "/time":
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("\n[ВРЕМЯ] " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+    elif command == "/ping":
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("\n[PING] pong"))
+
+    elif command == "/status":
         with clients_lock:
-            for _, _, name, pk in clients:
-                if pk:
-                    parts.append(name + ":" + pk)
-        send_frame(client_socket, TYPE_COMMAND, encrypt_message("[RESP]" + ";".join(parts)))
+            total = len(clients)
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message(f"\n[СТАТУС] Онлайн: {total}, комната: {client.room}"))
+
+    elif command == "/about":
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("\nMeshMessenger v0.2\nЗащищённый мессенджер с E2E-шифрованием.\nОсновной сервер: Go."))
+
+    elif command == "/clear":
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("\n" * 50))
+
+    elif command == "/help":
+        help_text = "\n[КОМАНДЫ]\n/users /rooms /roommembers\n/join <комната> [пароль] /leave\n/createroom <название> <пароль>\n/file <путь>\n/msg Имя текст - личное\n/time /status /ping /about\n/clear /exit /help"
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message(help_text))
 
     elif command == "/exit":
         client_socket.close()
@@ -231,3 +305,5 @@ def start_server():
 
 if __name__ == "__main__":
     start_server()
+
+

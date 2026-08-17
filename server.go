@@ -5,8 +5,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,9 +38,10 @@ type Client struct {
 }
 
 var (
-	clients      []*Client
-	clientsMutex sync.Mutex
-	encryptKey   []byte
+	clients       []*Client
+	clientsMutex  sync.Mutex
+	encryptKey    []byte
+	roomPasswords = map[string]string{}
 )
 
 const (
@@ -238,6 +241,11 @@ func pubKeysTable() string {
 	return strings.Join(parts, ";")
 }
 
+func hashPassword(pwd string) string {
+	h := sha256.Sum256([]byte(pwd))
+	return hex.EncodeToString(h[:])
+}
+
 func handleClient(conn net.Conn, address string) {
 	defer conn.Close()
 	var username string
@@ -256,6 +264,18 @@ func handleClient(conn net.Conn, address string) {
 	}
 
 	clientsMutex.Lock()
+	taken := false
+	for _, c := range clients {
+		if c.username == username {
+			taken = true
+			break
+		}
+	}
+	if taken {
+		clientsMutex.Unlock()
+		sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Имя уже занято, выбери другое"))
+		return
+	}
 	clients = append(clients, &Client{conn: conn, address: address, username: username, room: "main"})
 	clientsMutex.Unlock()
 
@@ -301,14 +321,13 @@ func handleClient(conn net.Conn, address string) {
 		} else if frameType == typeRegister {
 			parts := bytes.Split(payload, []byte{0})
 			if len(parts) >= 2 {
-				nm := strings.TrimSpace(string(parts[0]))
 				pk := string(parts[1])
 				if self != nil {
 					self.pubkey = pk
 				}
 				table := pubKeysTable()
 				sendFrameString(conn, typeCommand, encryptMessage("[ПУБКЛЮЧИ]" + table))
-				broadcastFrame(typeCommand, []byte(encryptMessage("[НОВЫЙ]" + nm + ":" + pk)), conn)
+				broadcastFrame(typeCommand, []byte(encryptMessage("[НОВЫЙ]" + username + ":" + pk)), conn)
 			}
 		}
 	}
@@ -355,20 +374,59 @@ func handleCommand(command string, self *Client) {
 		for _, c := range clients {
 			counts[c.room]++
 		}
-		clientsMutex.Unlock()
 		var parts []string
-		for r, n := range counts {
-			parts = append(parts, fmt.Sprintf("%s(%d)", r, n))
+		for r, p := range roomPasswords {
+			mark := "🔒"
+			if p == "" {
+				mark = "открыта"
+			}
+			parts = append(parts, fmt.Sprintf("%s(%s,%d)", r, mark, counts[r]))
 		}
+		clientsMutex.Unlock()
 		sendFrameString(conn, typeCommand, encryptMessage("\n[КОМНАТЫ] "+strings.Join(parts, ", ")))
 
+	case strings.HasPrefix(command, "/createroom "):
+		fields := strings.Fields(command)
+		if len(fields) < 2 {
+			break
+		}
+		room := fields[1]
+		pwd := ""
+		if len(fields) >= 3 {
+			pwd = fields[2]
+		}
+		clientsMutex.Lock()
+		if _, ok := roomPasswords[room]; ok {
+			clientsMutex.Unlock()
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Комната уже существует: " + room))
+			break
+		}
+		roomPasswords[room] = hashPassword(pwd)
+		clientsMutex.Unlock()
+		sendFrameString(conn, typeCommand, encryptMessage("\n[КОМНАТА] Создана комната " + room))
+
 	case strings.HasPrefix(command, "/join "):
-		room := strings.TrimSpace(strings.TrimPrefix(command, "/join "))
-		if room == "" {
+		fields := strings.Fields(command)
+		if len(fields) < 2 {
+			break
+		}
+		room := fields[1]
+		pwd := ""
+		if len(fields) >= 3 {
+			pwd = fields[2]
+		}
+		clientsMutex.Lock()
+		existing, ok := roomPasswords[room]
+		if !ok {
+			roomPasswords[room] = ""
+		} else if existing != "" && hashPassword(pwd) != existing {
+			clientsMutex.Unlock()
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Неверный пароль для " + room))
 			break
 		}
 		self.room = room
-		sendFrameString(conn, typeCommand, encryptMessage("\n[КОМНАТА] Вы в комнате: "+room))
+		clientsMutex.Unlock()
+		sendFrameString(conn, typeCommand, encryptMessage("\n[КОМНАТА] Вы в комнате: " + room))
 		fmt.Printf("[%s] перешёл в комнату %s\n", self.username, room)
 
 	case command == "/leave":
