@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import socket
 import threading
@@ -19,6 +20,25 @@ from modules.protocol import (
 clients = []
 clients_lock = threading.Lock()
 rooms = {}
+ACCOUNTS_FILE = "accounts.json"
+
+
+def load_accounts():
+    if os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_accounts():
+    with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(accounts, f, ensure_ascii=False, indent=2)
+
+
+accounts = load_accounts()
 
 
 class Client:
@@ -28,6 +48,8 @@ class Client:
         self.name = name
         self.pub = ""
         self.room = "main"
+        self.authed = False
+        self.activated = False
 
 
 def log_message(username, message_preview):
@@ -81,6 +103,16 @@ def pubkeys_table():
         return ";".join(f"{c.name}:{c.pub}" for c in clients if c.pub)
 
 
+def activate(client):
+    if client.activated:
+        return
+    client.activated = True
+    send_frame(client.sock, TYPE_COMMAND, encrypt_message("[ПУБКЛЮЧИ]" + pubkeys_table()))
+    broadcast_frame(TYPE_COMMAND, encrypt_message("[НОВЫЙ]" + client.name + ":" + client.pub), client.sock)
+    broadcast_to_room(TYPE_COMMAND, encrypt_message(f"\n[СИСТЕМА] {client.name} присоединился к чату"), client, client.room)
+    print(f"[АВТОРИЗАЦИЯ] {client.name} вошёл в систему")
+
+
 def handle_client(client_socket, client_address):
     username = None
     client = None
@@ -107,10 +139,13 @@ def handle_client(client_socket, client_address):
             client = Client(client_socket, client_address, username)
             clients.append(client)
 
-        print(f"[ПОДКЛЮЧЕНИЕ] {username} подключился с {client_address} (комната: main)")
+        print(f"[ПОДКЛЮЧЕНИЕ] {username} подключился с {client_address}")
 
-        join_text = f"\n[СИСТЕМА] {username} присоединился к чату"
-        broadcast_to_room(TYPE_COMMAND, encrypt_message(join_text), client, "main")
+        if username in accounts:
+            hint = "[AUTH]Аккаунт есть — войди: /login ник пароль"
+        else:
+            hint = "[AUTH]Новый ник — зарегистрируйся: /register ник пароль пароль"
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message(hint))
 
         while True:
             frame = recv_frame(client_socket)
@@ -118,6 +153,9 @@ def handle_client(client_socket, client_address):
                 break
 
             frame_type, payload = frame
+
+            if not client.authed and frame_type in (TYPE_MESSAGE, TYPE_FILE):
+                continue
 
             if frame_type == TYPE_MESSAGE:
                 if payload.count(b"\x00") >= 2:
@@ -154,13 +192,10 @@ def handle_client(client_socket, client_address):
 
             elif frame_type == TYPE_REGISTER:
                 _p = payload.split(b"\x00")
-                if len(_p) >= 2:
-                    pk = _p[1].decode("utf-8", errors="replace")
-                    if client is not None:
-                        client.pub = pk
-                    table = pubkeys_table()
-                    send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ПУБКЛЮЧИ]" + table))
-                    broadcast_frame(TYPE_COMMAND, encrypt_message("[НОВЫЙ]" + username + ":" + pk), client_socket)
+                if len(_p) >= 2 and client is not None:
+                    client.pub = _p[1].decode("utf-8", errors="replace")
+                    if client.authed:
+                        activate(client)
 
     except Exception:
         print("\n========== TRACEBACK ==========")
@@ -188,6 +223,54 @@ def handle_command(command, client):
         return
     client_socket = client.sock
     command = command.strip()
+
+    if not client.authed and not (command.startswith("/register") or command.startswith("/login")):
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("[AUTH]Сначала вход: /login ник пароль"))
+        return
+
+    if command.startswith("/register"):
+        parts = command.split()
+        if len(parts) != 4:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Формат: /register ник пароль пароль"))
+            return
+        _, nick, p1, p2 = parts
+        if nick != client.name:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Ник должен совпадать с именем подключения"))
+            return
+        if nick in accounts:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Ник уже зарегистрирован"))
+            return
+        if p1 != p2:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Пароли не совпадают"))
+            return
+        salt = os.urandom(16).hex()
+        accounts[nick] = {"salt": salt, "hash": hashlib.sha256((salt + p1).encode("utf-8")).hexdigest()}
+        save_accounts()
+        client.authed = True
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("[AUTH]OK"))
+        activate(client)
+        return
+
+    elif command.startswith("/login"):
+        parts = command.split()
+        if len(parts) != 3:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Формат: /login ник пароль"))
+            return
+        _, nick, pwd = parts
+        if nick != client.name:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Ник должен совпадать с именем подключения"))
+            return
+        acc = accounts.get(nick)
+        if not acc:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Аккаунт не найден, зарегистрируйся: /register ник пароль пароль"))
+            return
+        if hashlib.sha256((acc["salt"] + pwd).encode("utf-8")).hexdigest() != acc["hash"]:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Неверный пароль"))
+            return
+        client.authed = True
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("[AUTH]OK"))
+        activate(client)
+        return
 
     if command == "/users":
         with clients_lock:
@@ -226,13 +309,16 @@ def handle_command(command, client):
             send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Формат: /join <комната> [пароль]"))
             return
         with clients_lock:
-            if rname in rooms:
+            if rname == "main":
+                client.room = rname
+            elif rname in rooms:
                 if rooms[rname] and hashlib.sha256(pwd.encode("utf-8")).hexdigest() != rooms[rname]:
                     send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Неверный пароль для " + rname))
                     return
+                client.room = rname
             else:
-                rooms[rname] = ""
-            client.room = rname
+                send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Комнаты нет: " + rname + ". Создай: /createroom <имя> [пароль]"))
+                return
         send_frame(client_socket, TYPE_COMMAND, encrypt_message("\n[КОМНАТА] Вы в комнате: " + rname))
         print(f"[{client.name}] перешёл в комнату {rname}")
 
@@ -281,8 +367,8 @@ def handle_command(command, client):
 
 
 def start_server():
-    host = config["server"]["host"]
-    port = config["server"]["port"]
+    host = os.environ.get("MESH_HOST", config["server"]["host"])
+    port = int(os.environ.get("MESH_PORT", config["server"]["port"]))
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((host, port))

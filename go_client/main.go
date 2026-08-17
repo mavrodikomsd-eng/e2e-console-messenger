@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -389,16 +390,40 @@ func (c *Client) sendFileToRoom(path string) {
 	pprint("[Я] файл: " + fname + " отправлен в комнату")
 }
 
+func loadHostPort() (string, string) {
+	host := "127.0.0.1"
+	port := "1301"
+	var cfg struct {
+		Server struct {
+			Host string `json:"host"`
+			Port int    `json:"port"`
+		} `json:"server"`
+	}
+	for _, path := range []string{"config.json", "../config.json"} {
+		if data, err := os.ReadFile(path); err == nil {
+			if json.Unmarshal(data, &cfg) == nil {
+				if cfg.Server.Host != "" {
+					host = cfg.Server.Host
+				}
+				if cfg.Server.Port > 0 {
+					port = strconv.Itoa(cfg.Server.Port)
+				}
+				break
+			}
+		}
+	}
+	if h := os.Getenv("MESH_HOST"); h != "" {
+		host = h
+	}
+	if p := os.Getenv("MESH_PORT"); p != "" {
+		port = p
+	}
+	return host, port
+}
+
 func main() {
 	sharedKey = loadSharedKey()
-	host := os.Getenv("MESH_HOST")
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	port := os.Getenv("MESH_PORT")
-	if port == "" {
-		port = "1301"
-	}
+	host, port := loadHostPort()
 	priv, pubB64 := loadOrCreateIdentity()
 
 	conn, err := net.Dial("tcp", host+":"+port)

@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,11 +31,13 @@ type Config struct {
 }
 
 type Client struct {
-	conn     net.Conn
-	address  string
-	username string
-	room     string
-	pubkey   string
+	conn      net.Conn
+	address   string
+	username  string
+	room      string
+	pubkey    string
+	authed    bool
+	activated bool
 }
 
 var (
@@ -42,7 +45,29 @@ var (
 	clientsMutex  sync.Mutex
 	encryptKey    []byte
 	roomPasswords = map[string]string{}
+	accounts      = map[string]Account{}
 )
+
+const accountsFile = "accounts.json"
+
+type Account struct {
+	Salt string `json:"salt"`
+	Hash string `json:"hash"`
+}
+
+func loadAccounts() map[string]Account {
+	m := map[string]Account{}
+	data, err := os.ReadFile(accountsFile)
+	if err == nil {
+		json.Unmarshal(data, &m)
+	}
+	return m
+}
+
+func saveAccounts() {
+	data, _ := json.MarshalIndent(accounts, "", "  ")
+	os.WriteFile(accountsFile, data, 0600)
+}
 
 const (
 	nonceSize = 12
@@ -246,6 +271,17 @@ func hashPassword(pwd string) string {
 	return hex.EncodeToString(h[:])
 }
 
+func activate(c *Client) {
+	if c.activated {
+		return
+	}
+	c.activated = true
+	sendFrameString(c.conn, typeCommand, encryptMessage("[ПУБКЛЮЧИ]" + pubKeysTable()))
+	broadcastFrame(typeCommand, []byte(encryptMessage("[НОВЫЙ]" + c.username + ":" + c.pubkey)), c.conn)
+	broadcastToRoom(typeCommand, []byte(encryptMessage("\n[СИСТЕМА] "+c.username+" присоединился к чату")), c.conn, c.room)
+	fmt.Printf("[АВТОРИЗАЦИЯ] %s вошёл в систему\n", c.username)
+}
+
 func handleClient(conn net.Conn, address string) {
 	defer conn.Close()
 	var username string
@@ -279,10 +315,13 @@ func handleClient(conn net.Conn, address string) {
 	clients = append(clients, &Client{conn: conn, address: address, username: username, room: "main"})
 	clientsMutex.Unlock()
 
-	fmt.Printf("[ПОДКЛЮЧЕНИЕ] %s подключился с %s (комната: main)\n", username, address)
+	fmt.Printf("[ПОДКЛЮЧЕНИЕ] %s подключился с %s\n", username, address)
 
-	joinText := fmt.Sprintf("\n[СИСТЕМА] %s присоединился к чату", username)
-	broadcastToRoom(typeCommand, []byte(encryptMessage(joinText)), conn, "main")
+	hint := "[AUTH]Новый ник — зарегистрируйся: /register ник пароль пароль"
+	if _, ok := accounts[username]; ok {
+		hint = "[AUTH]Аккаунт есть — войди: /login ник пароль"
+	}
+	sendFrameString(conn, typeCommand, encryptMessage(hint))
 
 	for {
 		frameType, payload, err := recvFrame(conn)
@@ -294,6 +333,10 @@ func handleClient(conn net.Conn, address string) {
 		self := findClient(conn)
 		if self != nil {
 			room = self.room
+		}
+
+		if (frameType == typeMessage || frameType == typeFile) && (self == nil || !self.authed) {
+			continue
 		}
 
 		if frameType == typeMessage {
@@ -320,14 +363,11 @@ func handleClient(conn net.Conn, address string) {
 			handleCommand(decrypted, findClient(conn))
 		} else if frameType == typeRegister {
 			parts := bytes.Split(payload, []byte{0})
-			if len(parts) >= 2 {
-				pk := string(parts[1])
-				if self != nil {
-					self.pubkey = pk
+			if len(parts) >= 2 && self != nil {
+				self.pubkey = string(parts[1])
+				if self.authed {
+					activate(self)
 				}
-				table := pubKeysTable()
-				sendFrameString(conn, typeCommand, encryptMessage("[ПУБКЛЮЧИ]" + table))
-				broadcastFrame(typeCommand, []byte(encryptMessage("[НОВЫЙ]" + username + ":" + pk)), conn)
 			}
 		}
 	}
@@ -355,7 +395,70 @@ func handleCommand(command string, self *Client) {
 	conn := self.conn
 	command = strings.TrimSpace(command)
 
+	if !self.authed && !strings.HasPrefix(command, "/register") && !strings.HasPrefix(command, "/login") {
+		sendFrameString(conn, typeCommand, encryptMessage("[AUTH]Сначала вход: /login ник пароль"))
+		return
+	}
+
 	switch {
+	case strings.HasPrefix(command, "/register"):
+		fields := strings.Fields(command)
+		if len(fields) != 4 {
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Формат: /register ник пароль пароль"))
+			break
+		}
+		nick, p1, p2 := fields[1], fields[2], fields[3]
+		if nick != self.username {
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Ник должен совпадать с именем подключения"))
+			break
+		}
+		clientsMutex.Lock()
+		if _, ok := accounts[nick]; ok {
+			clientsMutex.Unlock()
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Ник уже зарегистрирован"))
+			break
+		}
+		if p1 != p2 {
+			clientsMutex.Unlock()
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Пароли не совпадают"))
+			break
+		}
+		salt := make([]byte, 16)
+		rand.Read(salt)
+		saltHex := hex.EncodeToString(salt)
+		accounts[nick] = Account{Salt: saltHex, Hash: hashPassword(saltHex + p1)}
+		saveAccounts()
+		clientsMutex.Unlock()
+		self.authed = true
+		sendFrameString(conn, typeCommand, encryptMessage("[AUTH]OK"))
+		activate(self)
+
+	case strings.HasPrefix(command, "/login"):
+		fields := strings.Fields(command)
+		if len(fields) != 3 {
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Формат: /login ник пароль"))
+			break
+		}
+		nick, pwd := fields[1], fields[2]
+		if nick != self.username {
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Ник должен совпадать с именем подключения"))
+			break
+		}
+		clientsMutex.Lock()
+		acc, ok := accounts[nick]
+		clientsMutex.Unlock()
+		if !ok {
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Аккаунт не найден, зарегистрируйся: /register ник пароль пароль"))
+			break
+		}
+		if hashPassword(acc.Salt+pwd) != acc.Hash {
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Неверный пароль"))
+			break
+		}
+		self.authed = true
+		sendFrameString(conn, typeCommand, encryptMessage("[AUTH]OK"))
+		activate(self)
+
 	case command == "/users":
 		clientsMutex.Lock()
 		var names []string
@@ -416,15 +519,20 @@ func handleCommand(command string, self *Client) {
 			pwd = fields[2]
 		}
 		clientsMutex.Lock()
-		existing, ok := roomPasswords[room]
-		if !ok {
-			roomPasswords[room] = ""
-		} else if existing != "" && hashPassword(pwd) != existing {
+		if room == "main" {
+			self.room = room
+		} else if existing, ok := roomPasswords[room]; ok {
+			if existing != "" && hashPassword(pwd) != existing {
+				clientsMutex.Unlock()
+				sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Неверный пароль для " + room))
+				break
+			}
+			self.room = room
+		} else {
 			clientsMutex.Unlock()
-			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Неверный пароль для " + room))
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Комнаты нет: " + room + ". Создай: /createroom <имя> [пароль]"))
 			break
 		}
-		self.room = room
 		clientsMutex.Unlock()
 		sendFrameString(conn, typeCommand, encryptMessage("\n[КОМНАТА] Вы в комнате: " + room))
 		fmt.Printf("[%s] перешёл в комнату %s\n", self.username, room)
@@ -503,14 +611,22 @@ func loadConfig(filename string) *Config {
 }
 
 func startServer(cfg *Config) {
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port))
+	host := cfg.Server.Host
+	port := cfg.Server.Port
+	if h := os.Getenv("MESH_HOST"); h != "" {
+		host = h
+	}
+	if p := os.Getenv("MESH_PORT"); p != "" {
+		port, _ = strconv.Atoi(p)
+	}
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 	defer listener.Close()
 
-	fmt.Printf("[СЕРВЕР] Запущен на %s:%d\n", cfg.Server.Host, cfg.Server.Port)
+	fmt.Printf("[СЕРВЕР] Запущен на %s:%d\n", host, port)
 	fmt.Println("[СЕРВЕР] Режим: E2E шифрование (сервер НЕ видит содержимое сообщений)\n")
 
 	for {
@@ -567,6 +683,7 @@ func loadOrCreateKey(cfg *Config) []byte {
 func main() {
 	cfg := loadConfig("configs.json")
 	encryptKey = loadOrCreateKey(cfg)
+	accounts = loadAccounts()
 
 	startServer(cfg)
 }

@@ -310,9 +310,54 @@ fn send_file_to_room(stream: &mut TcpStream, state: &State, shared_key: &[u8; 32
     pprint(&format!("[Я] файл: {} отправлен в комнату", fname));
 }
 
+fn load_config() -> (String, String) {
+    let mut host = String::from("127.0.0.1");
+    let mut port = String::from("1301");
+
+    #[derive(serde::Deserialize)]
+    struct Cfg {
+        server: Option<ServerCfg>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ServerCfg {
+        host: Option<String>,
+        port: Option<u16>,
+    }
+
+    for path in ["config.json", "../config.json"] {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(cfg) = serde_json::from_str::<Cfg>(&data) {
+                if let Some(s) = cfg.server {
+                    if let Some(h) = s.host {
+                        if !h.is_empty() {
+                            host = h;
+                        }
+                    }
+                    if let Some(p) = s.port {
+                        if p > 0 {
+                            port = p.to_string();
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    if let Ok(h) = std::env::var("MESH_HOST") {
+        if !h.is_empty() {
+            host = h;
+        }
+    }
+    if let Ok(p) = std::env::var("MESH_PORT") {
+        if !p.is_empty() {
+            port = p;
+        }
+    }
+    (host, port)
+}
+
 fn main() {
-    let host = std::env::var("MESH_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let port = std::env::var("MESH_PORT").unwrap_or_else(|_| "1301".into());
+    let (host, port) = load_config();
     let shared_key = load_shared_key();
 
     let (our_secret, pub_bytes) = load_or_create_identity();
