@@ -20,6 +20,8 @@ TYPE_MESSAGE = b"M"   # сообщение
 TYPE_COMMAND = b"C"   # команда
 TYPE_FILE = b"F"      # файл
 TYPE_REGISTER = b"R"  # регистрация публичного ключа
+TYPE_VERSION = b"V"   # версия протокола (рукопожатие)
+PROTOCOL_VERSION = 1
 
 HEADER_SIZE = 5  # 1 (тип) + 4 (длина)
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1 МБ

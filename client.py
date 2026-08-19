@@ -20,6 +20,8 @@ from modules.protocol import (
     TYPE_COMMAND,
     TYPE_FILE,
     TYPE_REGISTER,
+    TYPE_VERSION,
+    PROTOCOL_VERSION,
 )
 
 print_lock = threading.Lock()
@@ -125,9 +127,32 @@ class Client:
             safe_print(f"[{sender}] отправил файл: {fname}, но расшифровать не удалось")
             return
         raw = base64.b64decode(plain)
-        with open(fname, "wb") as f:
-            f.write(raw)
-        safe_print(f"[{sender}] отправил файл: {fname} ({len(raw)} байт) — сохранён")
+        base = self._safe_save_file(fname, raw)
+        if base is None:
+            safe_print(f"[{sender}] отправил файл: {fname}, но сохранить не удалось")
+            return
+        safe_print(f"[{sender}] отправил файл: {base} ({len(raw)} байт) — сохранён")
+
+    @staticmethod
+    def _safe_save_file(fname, raw):
+        base = os.path.basename(fname).strip()
+        if base in ("", ".", "..") or "/" in base or "\\" in base:
+            return None
+        downloads = os.path.abspath(os.path.join(os.getcwd(), "downloads"))
+        os.makedirs(downloads, exist_ok=True)
+        final = os.path.abspath(os.path.join(downloads, base))
+        if not final.startswith(downloads + os.sep):
+            return None
+        try:
+            fd = os.open(final, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        except OSError:
+            return None
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+        except Exception:
+            return None
+        return base
 
     def _recipient_pub(self, name):
         pub = self.known_keys.get(name)
@@ -230,6 +255,7 @@ def start_client():
         if not username:
             username = "Аноним"
         send_frame(sock, TYPE_MESSAGE, username)
+        send_frame(sock, TYPE_VERSION, str(PROTOCOL_VERSION))
         c = Client(sock, username)
         send_frame(sock, TYPE_REGISTER, c.username.encode("utf-8") + b"\x00" + c.pub_b64.encode("utf-8"))
         print(f"\nДобро пожаловать, {username}!")

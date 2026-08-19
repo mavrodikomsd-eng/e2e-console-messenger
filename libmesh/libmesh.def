@@ -1,0 +1,11 @@
+LIBRARY libmesh
+EXPORTS
+    lm_load_or_create_identity
+    lm_derive_key
+    lm_gcm_encrypt_b64
+    lm_gcm_decrypt_b64
+    lm_encrypt_to_peer
+    lm_argon2id
+    lm_frame_encode
+    lm_frame_decode
+    lm_free

@@ -6,6 +6,17 @@ import sys
 from Crypto.Cipher import AES
 from Crypto.Protocol import DH
 
+# ─────────────────────────────────────────────
+#  Опциональное нативное ядро (libmesh) для peer-cryptography.
+#  Если libmesh.dll (.so) доступен — encrypt_to_peer/decrypt_from_peer
+#  используют его; иначе автоматический фоллбэк на pycryptodome.
+# ─────────────────────────────────────────────
+try:
+    from .libmesh_ffi import _libmesh as _LM
+    _LM_DLL = True
+except Exception:
+    _LM_DLL = False
+
 KEY_FILE = "secret.key"
 CONFIG_FILE = "config.json"
 
@@ -24,8 +35,9 @@ KEY_SIZE = 32  # AES-256
 
 
 def _write_key_file(key: bytes) -> None:
-    """Сохраняет ключ (base64) в файл secret.key."""
-    with open(KEY_FILE, "w", encoding="utf-8") as f:
+    """Сохраняет ключ (base64) в файл secret.key (права 0600)."""
+    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(base64.b64encode(key).decode("ascii") + "\n")
 
 
@@ -138,7 +150,8 @@ def load_or_create_identity():
     pub = priv.public_key().export_key(format="raw")
     seed_b64 = base64.b64encode(seed).decode("ascii")
     pub_b64 = base64.b64encode(pub).decode("ascii")
-    with open(path, "w", encoding="utf-8") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(f"{seed_b64} {pub_b64}\n")
     return seed_b64, pub_b64
 
@@ -156,10 +169,20 @@ def _derive_key(our_seed_b64, peer_pub_b64):
 
 
 def encrypt_to_peer(plaintext, peer_pub_b64, self_pub_b64, our_seed_b64):
+    if _LM_DLL:
+        pt = plaintext.encode("utf-8") if isinstance(plaintext, str) else bytes(plaintext)
+        return _LM.encrypt_to_peer(our_seed_b64, peer_pub_b64, self_pub_b64, pt)
     key = _derive_key(our_seed_b64, peer_pub_b64)
     return _gcm_encrypt(key, plaintext, aad=self_pub_b64)
 
 
 def decrypt_from_peer(encoded, sender_pub_b64, our_seed_b64):
+    if _LM_DLL:
+        try:
+            return _LM.gcm_decrypt(
+                _LM.derive_key(our_seed_b64, sender_pub_b64), encoded,
+                aad=sender_pub_b64.encode("utf-8"))
+        except Exception:
+            return None
     key = _derive_key(our_seed_b64, sender_pub_b64)
     return _gcm_decrypt(key, encoded, aad=sender_pub_b64)

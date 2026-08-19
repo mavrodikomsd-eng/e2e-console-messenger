@@ -4,6 +4,9 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -17,7 +20,10 @@ const TYPE_MESSAGE: u8 = b'M';
 const TYPE_COMMAND: u8 = b'C';
 const TYPE_FILE: u8 = b'F';
 const TYPE_REGISTER: u8 = b'R';
+const TYPE_VERSION: u8 = b'V';
+const PROTOCOL_VERSION: &str = "1";
 const MAX_FILE: usize = 400_000;
+const MAX_FRAME: usize = 1 << 20;
 
 static PRINT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -43,6 +49,12 @@ fn recv_frame(stream: &mut TcpStream) -> io::Result<Option<(u8, Vec<u8>)>> {
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload)?;
     Ok(Some((header[0], payload)))
@@ -59,7 +71,7 @@ fn load_shared_key() -> [u8; 32] {
     }
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
-    let _ = std::fs::write(&path, B64.encode(key));
+    let _ = write_file_secure(Path::new(&path), B64.encode(key).as_bytes());
     key
 }
 
@@ -79,7 +91,7 @@ fn load_or_create_identity() -> (StaticSecret, Vec<u8>) {
     rand::thread_rng().fill_bytes(&mut seed);
     let secret = StaticSecret::from(seed);
     let pub_bytes = PublicKey::from(&secret).to_bytes().to_vec();
-    let _ = std::fs::write(&path, format!("{} {}\n", B64.encode(seed), B64.encode(&pub_bytes)));
+    let _ = write_file_secure(Path::new(&path), format!("{} {}\n", B64.encode(seed), B64.encode(&pub_bytes)).as_bytes());
     (secret, pub_bytes)
 }
 
@@ -93,17 +105,17 @@ fn derive_key(our: &StaticSecret, peer_pub: &[u8; 32]) -> [u8; 32] {
     key
 }
 
-fn gcm_encrypt(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> String {
-    let cipher = Aes256Gcm::new_from_slice(key).expect("bad key");
+fn gcm_encrypt(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Option<String> {
+    let cipher = Aes256Gcm::new_from_slice(key).ok()?;
     let mut nonce = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce);
     let ct = cipher
         .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
-        .expect("encrypt failed");
+        .ok()?;
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
-    B64.encode(out)
+    Some(B64.encode(out))
 }
 
 fn gcm_decrypt(key: &[u8; 32], encoded: &str, aad: &[u8]) -> Option<String> {
@@ -118,8 +130,8 @@ fn gcm_decrypt(key: &[u8; 32], encoded: &str, aad: &[u8]) -> Option<String> {
     String::from_utf8(pt).ok()
 }
 
-fn encrypt_to_peer(text: &str, peer_pub_b64: &str, self_pub_b64: &str, our: &StaticSecret) -> String {
-    let peer_pub: [u8; 32] = B64.decode(peer_pub_b64).expect("bad peer pub").try_into().expect("peer pub len");
+fn encrypt_to_peer(text: &str, peer_pub_b64: &str, self_pub_b64: &str, our: &StaticSecret) -> Option<String> {
+    let peer_pub: [u8; 32] = B64.decode(peer_pub_b64).ok()?.try_into().ok()?;
     let key = derive_key(our, &peer_pub);
     gcm_encrypt(&key, text.as_bytes(), self_pub_b64.as_bytes())
 }
@@ -152,11 +164,61 @@ fn insert_keys(state: &State, text: &str) {
 fn request(stream: &mut TcpStream, state: &State, shared_key: &[u8; 32], cmd: &str) -> Option<String> {
     let (tx, rx) = mpsc::channel();
     *state.pending.lock().unwrap() = Some(tx);
-    let enc = gcm_encrypt(shared_key, cmd.as_bytes(), b"");
+    let enc = match gcm_encrypt(shared_key, cmd.as_bytes(), b"") {
+        Some(e) => e,
+        None => return None,
+    };
     if send_frame(stream, TYPE_COMMAND, enc.as_bytes()).is_err() {
         return None;
     }
     rx.recv_timeout(Duration::from_secs(3)).ok()
+}
+
+fn safe_file_name(raw: &str) -> String {
+    let file = Path::new(raw.trim())
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let name = file.trim().to_string();
+    if name.is_empty() || name == "." || name == ".." {
+        return String::new();
+    }
+    if name.contains('/') || name.contains('\\') {
+        return String::new();
+    }
+    name
+}
+
+#[cfg(unix)]
+fn write_file_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)
+}
+
+#[cfg(not(unix))]
+fn write_file_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, data)
+}
+
+fn save_received_file(base: &str, raw: &[u8]) -> bool {
+    let dir = match std::env::current_dir().map(|p| p.join("downloads")) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let final_path = dir.join(base);
+    if !final_path.is_absolute() || !final_path.starts_with(&dir) {
+        return false;
+    }
+    write_file_secure(&final_path, raw).is_ok()
 }
 
 fn handle_message(state: &State, our: &StaticSecret, payload: &[u8]) {
@@ -189,9 +251,15 @@ fn handle_file(state: &State, our: &StaticSecret, payload: &[u8]) {
         None => pprint(&format!("[{}] отправил файл: {}, но ключ неизвестен", sender, fname)),
         Some(pk) => match decrypt_from_peer(&data, &pk, our) {
             Some(b64) => match B64.decode(b64.trim()) {
-                Ok(raw) => match std::fs::write(&fname, &raw) {
-                    Ok(()) => pprint(&format!("[{}] отправил файл: {} ({} байт) — сохранён", sender, fname, raw.len())),
-                    Err(_) => pprint(&format!("[{}] отправил файл: {}, но сохранить не удалось", sender, fname)),
+                Ok(raw) => {
+                    let base = safe_file_name(&fname);
+                    if base.is_empty() {
+                        pprint(&format!("[{}] отправил файл: {}, но имя недопустимо", sender, fname));
+                    } else if save_received_file(&base, &raw) {
+                        pprint(&format!("[{}] отправил файл: {} ({} байт) — сохранён", sender, base, raw.len()));
+                    } else {
+                        pprint(&format!("[{}] отправил файл: {}, но сохранить не удалось", sender, fname));
+                    }
                 },
                 Err(_) => pprint(&format!("[{}] отправил файл: {}, но расшифровать не удалось", sender, fname)),
             },
@@ -252,7 +320,13 @@ fn send_to(stream: &mut TcpStream, state: &State, shared_key: &[u8; 32], our: &S
             return false;
         }
     };
-    let ct = encrypt_to_peer(text, &pubk, self_pub_b64, our);
+    let ct = match encrypt_to_peer(text, &pubk, self_pub_b64, our) {
+        Some(c) => c,
+        None => {
+            pprint(&format!("[ОШИБКА] Не удалось зашифровать сообщение для {}", target));
+            return false;
+        }
+    };
     let payload = format!("{}\x00{}\x00{}", username, target, ct);
     send_frame(stream, TYPE_MESSAGE, payload.as_bytes()).is_ok()
 }
@@ -280,7 +354,13 @@ fn room_targets(stream: &mut TcpStream, state: &State, shared_key: &[u8; 32], us
 fn send_to_room(stream: &mut TcpStream, state: &State, shared_key: &[u8; 32], our: &StaticSecret, self_pub_b64: &str, username: &str, text: &str) {
     let targets = room_targets(stream, state, shared_key, username);
     for (name, pubk) in &targets {
-        let ct = encrypt_to_peer(text, pubk, self_pub_b64, our);
+        let ct = match encrypt_to_peer(text, pubk, self_pub_b64, our) {
+            Some(c) => c,
+            None => {
+                pprint(&format!("[ОШИБКА] Не удалось зашифровать сообщение для {}", name));
+                continue;
+            }
+        };
         let payload = format!("{}\x00{}\x00{}", username, name, ct);
         let _ = send_frame(stream, TYPE_MESSAGE, payload.as_bytes());
     }
@@ -303,7 +383,13 @@ fn send_file_to_room(stream: &mut TcpStream, state: &State, shared_key: &[u8; 32
     let b64 = B64.encode(&raw);
     let targets = room_targets(stream, state, shared_key, username);
     for (name, pubk) in &targets {
-        let data = encrypt_to_peer(&b64, pubk, self_pub_b64, our);
+        let data = match encrypt_to_peer(&b64, pubk, self_pub_b64, our) {
+            Some(c) => c,
+            None => {
+                pprint(&format!("[ОШИБКА] Не удалось зашифровать файл для {}", name));
+                continue;
+            }
+        };
         let payload = format!("{}\x00{}\x00{}\x00{}", username, name, fname, data);
         let _ = send_frame(stream, TYPE_FILE, payload.as_bytes());
     }
@@ -379,6 +465,7 @@ fn main() {
     let username = if name.trim().is_empty() { "Аноним".to_string() } else { name.trim().to_string() };
 
     let _ = send_frame(&mut stream, TYPE_MESSAGE, username.as_bytes());
+    let _ = send_frame(&mut stream, TYPE_VERSION, PROTOCOL_VERSION.as_bytes());
     let reg = format!("{}\x00{}", username, pub_b64);
     let _ = send_frame(&mut stream, TYPE_REGISTER, reg.as_bytes());
 
@@ -434,8 +521,9 @@ fn main() {
         } else if let Some(rest) = msg.strip_prefix("/file ") {
             send_file_to_room(&mut stream, &state, &shared_key, &our, &pub_b64, &username, rest.trim());
         } else if msg.starts_with('/') {
-            let enc = gcm_encrypt(&shared_key, msg.as_bytes(), b"");
-            let _ = send_frame(&mut stream, TYPE_COMMAND, enc.as_bytes());
+            if let Some(enc) = gcm_encrypt(&shared_key, msg.as_bytes(), b"") {
+                let _ = send_frame(&mut stream, TYPE_COMMAND, enc.as_bytes());
+            }
         } else {
             send_to_room(&mut stream, &state, &shared_key, &our, &pub_b64, &username, &msg);
         }

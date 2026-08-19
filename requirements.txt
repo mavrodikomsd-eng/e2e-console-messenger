@@ -1,1 +1,2 @@
 pycryptodome==3.18.0
+argon2-cffi==25.1.0

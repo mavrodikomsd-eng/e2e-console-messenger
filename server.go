@@ -6,7 +6,9 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"golang.org/x/crypto/argon2"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -31,18 +33,21 @@ type Config struct {
 }
 
 type Client struct {
-	conn      net.Conn
-	address   string
-	username  string
-	room      string
-	pubkey    string
-	authed    bool
-	activated bool
+	conn           net.Conn
+	address        string
+	username       string
+	room           string
+	pubkey         string
+	authed         bool
+	activated      bool
+	loginAttempts  int
+		protoVersion   int
 }
 
 var (
 	clients       []*Client
 	clientsMutex  sync.Mutex
+	logMu         sync.Mutex
 	encryptKey    []byte
 	roomPasswords = map[string]string{}
 	accounts      = map[string]Account{}
@@ -51,8 +56,12 @@ var (
 const accountsFile = "accounts.json"
 
 type Account struct {
-	Salt string `json:"salt"`
-	Hash string `json:"hash"`
+	Salt    string `json:"salt"`
+	Hash    string `json:"hash"`
+	Alg     string `json:"alg"`
+	Memory  uint32 `json:"memory"`
+	Time    uint32 `json:"time"`
+	Threads uint8  `json:"threads"`
 }
 
 func loadAccounts() map[string]Account {
@@ -80,12 +89,16 @@ const (
 	typeCommand  = byte('C')
 	typeFile     = byte('F')
 	typeRegister = byte('R')
+		typeVersion  = byte('V')
+		protoVersion = 1
 	headerSize   = 5
 
 	keyFile = "secret.key"
 )
 
 func logMessage(username, messagePreview string) {
+	logMu.Lock()
+	defer logMu.Unlock()
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	logEntry := fmt.Sprintf("[%s] %s: %s\n", timestamp, username, messagePreview)
 	f, err := os.OpenFile("messages.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -226,7 +239,7 @@ func sendToUsername(frameType byte, payload []byte, senderConn net.Conn, target 
 	defer clientsMutex.Unlock()
 
 	for _, client := range clients {
-		if client.conn != senderConn && client.username == target {
+		if client.conn != senderConn && client.username == target && client.authed {
 			sendFrame(client.conn, frameType, payload)
 			return
 		}
@@ -259,7 +272,7 @@ func pubKeysTable() string {
 	defer clientsMutex.Unlock()
 	var parts []string
 	for _, c := range clients {
-		if c.pubkey != "" {
+		if c.authed && c.pubkey != "" {
 			parts = append(parts, c.username+":"+c.pubkey)
 		}
 	}
@@ -271,6 +284,47 @@ func hashPassword(pwd string) string {
 	return hex.EncodeToString(h[:])
 }
 
+const (
+	argonMemory  = 64 * 1024
+	argonTime    = 2
+	argonThreads = 1
+	argonKeyLen  = 32
+)
+
+// newArgon2Account creates a salted argon2id(password) hash with params
+// stored alongside, in a format shared with server.py.
+func newArgon2Account(pwd string) Account {
+	salt := make([]byte, 16)
+	rand.Read(salt)
+	key := argon2.IDKey([]byte(pwd), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	return Account{
+		Salt:    base64.RawStdEncoding.EncodeToString(salt),
+		Hash:    base64.RawStdEncoding.EncodeToString(key),
+		Alg:     "argon2id",
+		Memory:  argonMemory,
+		Time:    argonTime,
+		Threads: argonThreads,
+	}
+}
+
+func verifyArgon2(acc Account, pwd string) bool {
+	salt, err := base64.RawStdEncoding.DecodeString(acc.Salt)
+	if err != nil {
+		return false
+	}
+	expected, err := base64.RawStdEncoding.DecodeString(acc.Hash)
+	if err != nil {
+		return false
+	}
+	key := argon2.IDKey([]byte(pwd), salt, acc.Time, acc.Memory, acc.Threads, argonKeyLen)
+	return subtle.ConstantTimeCompare(key, expected) == 1
+}
+
+// verifyLegacy checks the pre-argon2 accounts.json format (salted SHA-256).
+func verifyLegacy(acc Account, pwd string) bool {
+	return acc.Hash != "" && hashPassword(acc.Salt+pwd) == acc.Hash
+}
+
 func activate(c *Client) {
 	if c.activated {
 		return
@@ -280,6 +334,19 @@ func activate(c *Client) {
 	broadcastFrame(typeCommand, []byte(encryptMessage("[НОВЫЙ]" + c.username + ":" + c.pubkey)), c.conn)
 	broadcastToRoom(typeCommand, []byte(encryptMessage("\n[СИСТЕМА] "+c.username+" присоединился к чату")), c.conn, c.room)
 	fmt.Printf("[АВТОРИЗАЦИЯ] %s вошёл в систему\n", c.username)
+}
+
+func validUsername(name string) bool {
+	if name == "" || len(name) > 32 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c == 0 || c == ';' || c == ':' || c == '\n' || c == '\r' {
+			return false
+		}
+	}
+	return true
 }
 
 func handleClient(conn net.Conn, address string) {
@@ -295,8 +362,9 @@ func handleClient(conn net.Conn, address string) {
 		return
 	}
 	username = strings.TrimSpace(string(nameData))
-	if username == "" {
-		username = fmt.Sprintf("User_%s", address)
+	if !validUsername(username) {
+		sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Недопустимое имя пользователя"))
+		return
 	}
 
 	clientsMutex.Lock()
@@ -361,13 +429,20 @@ func handleClient(conn net.Conn, address string) {
 				continue
 			}
 			handleCommand(decrypted, findClient(conn))
+		} else if frameType == typeVersion {
+			if self != nil && strings.TrimSpace(string(payload)) != strconv.Itoa(protoVersion) {
+				sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Неподдерживаемая версия протокола"))
+				conn.Close()
+				break
+			}
 		} else if frameType == typeRegister {
+			if self == nil || !self.authed {
+				continue
+			}
 			parts := bytes.Split(payload, []byte{0})
-			if len(parts) >= 2 && self != nil {
+			if len(parts) >= 2 {
 				self.pubkey = string(parts[1])
-				if self.authed {
-					activate(self)
-				}
+				activate(self)
 			}
 		}
 	}
@@ -423,10 +498,7 @@ func handleCommand(command string, self *Client) {
 			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Пароли не совпадают"))
 			break
 		}
-		salt := make([]byte, 16)
-		rand.Read(salt)
-		saltHex := hex.EncodeToString(salt)
-		accounts[nick] = Account{Salt: saltHex, Hash: hashPassword(saltHex + p1)}
+		accounts[nick] = newArgon2Account(p1)
 		saveAccounts()
 		clientsMutex.Unlock()
 		self.authed = true
@@ -447,15 +519,28 @@ func handleCommand(command string, self *Client) {
 		clientsMutex.Lock()
 		acc, ok := accounts[nick]
 		clientsMutex.Unlock()
-		if !ok {
-			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Аккаунт не найден, зарегистрируйся: /register ник пароль пароль"))
-			break
+		valid := false
+		if ok {
+			if acc.Alg == "" {
+				valid = verifyLegacy(acc, pwd)
+				if valid {
+					accounts[nick] = newArgon2Account(pwd)
+					saveAccounts()
+				}
+			} else {
+				valid = verifyArgon2(acc, pwd)
+			}
 		}
-		if hashPassword(acc.Salt+pwd) != acc.Hash {
-			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Неверный пароль"))
+		if !valid {
+			self.loginAttempts++
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Неверные учётные данные"))
+			if self.loginAttempts >= 5 {
+				conn.Close()
+			}
 			break
 		}
 		self.authed = true
+		self.loginAttempts = 0
 		sendFrameString(conn, typeCommand, encryptMessage("[AUTH]OK"))
 		activate(self)
 
@@ -504,7 +589,14 @@ func handleCommand(command string, self *Client) {
 			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Комната уже существует: " + room))
 			break
 		}
-		roomPasswords[room] = hashPassword(pwd)
+		if pwd != "" {
+			rsalt := make([]byte, 16)
+			rand.Read(rsalt)
+			rsaltHex := hex.EncodeToString(rsalt)
+			roomPasswords[room] = rsaltHex + ":" + hashPassword(rsaltHex + pwd)
+		} else {
+			roomPasswords[room] = ""
+		}
 		clientsMutex.Unlock()
 		sendFrameString(conn, typeCommand, encryptMessage("\n[КОМНАТА] Создана комната " + room))
 
@@ -522,7 +614,15 @@ func handleCommand(command string, self *Client) {
 		if room == "main" {
 			self.room = room
 		} else if existing, ok := roomPasswords[room]; ok {
-			if existing != "" && hashPassword(pwd) != existing {
+			okPass := existing == ""
+			if !okPass {
+				if idx := strings.Index(existing, ":"); idx >= 0 {
+					okPass = hashPassword(existing[:idx] + pwd) == existing[idx+1:]
+				} else {
+					okPass = hashPassword(pwd) == existing
+				}
+			}
+			if !okPass {
 				clientsMutex.Unlock()
 				sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Неверный пароль для " + room))
 				break
@@ -558,7 +658,7 @@ func handleCommand(command string, self *Client) {
 		pub := ""
 		clientsMutex.Lock()
 		for _, c := range clients {
-			if c.username == name {
+			if c.username == name && c.authed && c.pubkey != "" {
 				pub = c.pubkey
 				break
 			}
@@ -573,7 +673,7 @@ func handleCommand(command string, self *Client) {
 		clientsMutex.Lock()
 		var parts []string
 		for _, c := range clients {
-			if c.room == self.room && c.pubkey != "" {
+			if c.room == self.room && c.authed && c.pubkey != "" {
 				parts = append(parts, c.username+":"+c.pubkey)
 			}
 		}

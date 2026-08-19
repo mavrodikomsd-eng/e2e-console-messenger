@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,8 @@ const (
 	typeCommand  = byte('C')
 	typeFile     = byte('F')
 	typeRegister = byte('R')
+	typeVersion  = byte('V')
+	protoVersion = 1
 	headerSize   = 5
 	maxFileSize  = 400000
 )
@@ -249,6 +252,55 @@ func (c *Client) handleMessage(payload []byte) {
 		pprint(fmt.Sprintf("[%s]: (не удалось расшифровать — подмена/ключ)", sender))
 	}
 }
+// sanitizeFileName reduces an incoming filename to a safe base name.
+// It strips directory components and rejects empty / unsafe names.
+func sanitizeFileName(raw string) string {
+	lastSep := -1
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '/' || raw[i] == '\\' {
+			lastSep = i
+		}
+	}
+	name := raw
+	if lastSep >= 0 {
+		name = raw[lastSep+1:]
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return ""
+	}
+	// Defense in depth: no path separators may remain.
+	if strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return ""
+	}
+	return name
+}
+
+// saveReceivedFile writes raw into downloads/<base>, creating the folder if
+// needed. It refuses any target that escapes downloads/. Returns true on ok.
+func saveReceivedFile(base string, raw []byte) bool {
+	dir := filepath.Join("downloads")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	absFinal, err := filepath.Abs(filepath.Join(absDir, base))
+	if err != nil {
+		return false
+	}
+	if !strings.HasPrefix(absFinal, absDir+string(filepath.Separator)) {
+		return false
+	}
+	if err := os.WriteFile(absFinal, raw, 0600); err != nil {
+		return false
+	}
+	return true
+}
+
+
 
 func (c *Client) handleFile(payload []byte) {
 	parts := splitZero(payload)
@@ -274,7 +326,12 @@ func (c *Client) handleFile(payload []byte) {
 		pprint(fmt.Sprintf("[%s] отправил файл: %s, но расшифровать не удалось", sender, fname))
 		return
 	}
-	if err := os.WriteFile(fname, raw, 0644); err != nil {
+	base := sanitizeFileName(fname)
+	if base == "" {
+		pprint(fmt.Sprintf("[%s] отправил файл: %s, но имя недопустимо", sender, fname))
+		return
+	}
+	if !saveReceivedFile(base, raw) {
 		pprint(fmt.Sprintf("[%s] отправил файл: %s, но сохранить не удалось", sender, fname))
 		return
 	}
@@ -444,6 +501,7 @@ func main() {
 	}
 
 	sendFrame(conn, typeMessage, []byte(name))
+	sendFrame(conn, typeVersion, []byte(strconv.Itoa(protoVersion)))
 	c := &Client{
 		conn:    conn,
 		name:    name,

@@ -1,10 +1,13 @@
+import base64
 import hashlib
+import hmac
 import json
 import os
 import socket
 import threading
 import traceback
 from datetime import datetime
+from argon2.low_level import hash_secret_raw, Type as Argon2Type
 from modules.crypto import encrypt_message, decrypt_message
 from modules.config import config
 from modules.protocol import (
@@ -15,6 +18,8 @@ from modules.protocol import (
     TYPE_COMMAND,
     TYPE_FILE,
     TYPE_REGISTER,
+    TYPE_VERSION,
+    PROTOCOL_VERSION,
 )
 
 clients = []
@@ -34,8 +39,62 @@ def load_accounts():
 
 
 def save_accounts():
-    with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+    fd = os.open(ACCOUNTS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(accounts, f, ensure_ascii=False, indent=2)
+
+
+def valid_username(name):
+    if not name or len(name) > 32:
+        return False
+    for ch in name:
+        if ch in "\x00;:\n\r":
+            return False
+    return True
+
+
+ARGON_TIME = 2
+ARGON_MEMORY = 64 * 1024
+ARGON_THREADS = 1
+ARGON_KEY_LEN = 32
+
+
+def _b64nopad(data):
+    return base64.b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64d_pad(s):
+    return base64.b64decode(s + "=" * (-len(s) % 4))
+
+
+def argon2_hash(password):
+    salt = os.urandom(16)
+    raw = hash_secret_raw(
+        password.encode("utf-8"), salt,
+        ARGON_TIME, ARGON_MEMORY, ARGON_THREADS, ARGON_KEY_LEN,
+        type=Argon2Type.ID,
+    )
+    return {
+        "alg": "argon2id",
+        "salt": _b64nopad(salt),
+        "hash": _b64nopad(raw),
+        "time": ARGON_TIME,
+        "memory": ARGON_MEMORY,
+        "threads": ARGON_THREADS,
+    }
+
+
+def argon2_verify(acc, password):
+    try:
+        salt = _b64d_pad(acc["salt"])
+        raw = hash_secret_raw(
+            password.encode("utf-8"), salt,
+            acc["time"], acc["memory"], acc["threads"], ARGON_KEY_LEN,
+            type=Argon2Type.ID,
+        )
+        return hmac.compare_digest(_b64nopad(raw), acc["hash"])
+    except Exception:
+        return False
 
 
 accounts = load_accounts()
@@ -50,6 +109,8 @@ class Client:
         self.room = "main"
         self.authed = False
         self.activated = False
+        self.login_attempts = 0
+        self.proto_version = 1
 
 
 def log_message(username, message_preview):
@@ -82,6 +143,8 @@ def broadcast_frame(frame_type, payload, sender_socket=None, target=None):
                 continue
             if target is not None and c.name != target:
                 continue
+            if target is not None and not c.authed:
+                continue
             try:
                 send_frame(c.sock, frame_type, payload)
             except Exception:
@@ -100,7 +163,7 @@ def broadcast_to_room(frame_type, payload, sender, room):
 
 def pubkeys_table():
     with clients_lock:
-        return ";".join(f"{c.name}:{c.pub}" for c in clients if c.pub)
+        return ";".join(f"{c.name}:{c.pub}" for c in clients if c.authed and c.pub)
 
 
 def activate(client):
@@ -123,8 +186,10 @@ def handle_client(client_socket, client_address):
             return
 
         username = first[1].decode("utf-8").strip()
-        if not username:
-            username = f"User_{client_address[1]}"
+        if not valid_username(username):
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Недопустимое имя пользователя"))
+            client_socket.close()
+            return
 
         with clients_lock:
             if any(c.name == username for c in clients):
@@ -155,6 +220,15 @@ def handle_client(client_socket, client_address):
             frame_type, payload = frame
 
             if not client.authed and frame_type in (TYPE_MESSAGE, TYPE_FILE):
+                continue
+
+            if frame_type == TYPE_VERSION:
+                ver = payload.decode("utf-8", errors="replace").strip()
+                if ver != str(PROTOCOL_VERSION):
+                    send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Неподдерживаемая версия протокола"))
+                    client_socket.close()
+                    return
+                client.proto_version = PROTOCOL_VERSION
                 continue
 
             if frame_type == TYPE_MESSAGE:
@@ -191,11 +265,12 @@ def handle_client(client_socket, client_address):
                     broadcast_to_room(TYPE_FILE, payload, client, client.room)
 
             elif frame_type == TYPE_REGISTER:
+                if client is None or not client.authed:
+                    continue
                 _p = payload.split(b"\x00")
-                if len(_p) >= 2 and client is not None:
+                if len(_p) >= 2:
                     client.pub = _p[1].decode("utf-8", errors="replace")
-                    if client.authed:
-                        activate(client)
+                    activate(client)
 
     except Exception:
         print("\n========== TRACEBACK ==========")
@@ -243,8 +318,7 @@ def handle_command(command, client):
         if p1 != p2:
             send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Пароли не совпадают"))
             return
-        salt = os.urandom(16).hex()
-        accounts[nick] = {"salt": salt, "hash": hashlib.sha256((salt + p1).encode("utf-8")).hexdigest()}
+        accounts[nick] = argon2_hash(p1)
         save_accounts()
         client.authed = True
         send_frame(client_socket, TYPE_COMMAND, encrypt_message("[AUTH]OK"))
@@ -261,13 +335,26 @@ def handle_command(command, client):
             send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Ник должен совпадать с именем подключения"))
             return
         acc = accounts.get(nick)
-        if not acc:
-            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Аккаунт не найден, зарегистрируйся: /register ник пароль пароль"))
-            return
-        if hashlib.sha256((acc["salt"] + pwd).encode("utf-8")).hexdigest() != acc["hash"]:
-            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Неверный пароль"))
+        valid = False
+        if acc:
+            if acc.get("alg"):
+                valid = argon2_verify(acc, pwd)
+            else:
+                valid = hmac.compare_digest(
+                    hashlib.sha256((acc["salt"] + pwd).encode("utf-8")).hexdigest(),
+                    acc["hash"],
+                )
+                if valid:
+                    accounts[nick] = argon2_hash(pwd)
+                    save_accounts()
+        if not valid:
+            client.login_attempts += 1
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Неверные учётные данные"))
+            if client.login_attempts >= 5:
+                client_socket.close()
             return
         client.authed = True
+        client.login_attempts = 0
         send_frame(client_socket, TYPE_COMMAND, encrypt_message("[AUTH]OK"))
         activate(client)
         return
@@ -298,7 +385,11 @@ def handle_command(command, client):
             if rname in rooms:
                 send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Комната уже существует: " + rname))
                 return
-            rooms[rname] = hashlib.sha256(pwd.encode("utf-8")).hexdigest() if pwd else ""
+            if pwd:
+                rsalt = os.urandom(16).hex()
+                rooms[rname] = rsalt + ":" + hashlib.sha256((rsalt + pwd).encode("utf-8")).hexdigest()
+            else:
+                rooms[rname] = ""
         send_frame(client_socket, TYPE_COMMAND, encrypt_message(f"\n[КОМНАТА] Создана комната {rname}"))
 
     elif command.startswith("/join "):
@@ -312,7 +403,15 @@ def handle_command(command, client):
             if rname == "main":
                 client.room = rname
             elif rname in rooms:
-                if rooms[rname] and hashlib.sha256(pwd.encode("utf-8")).hexdigest() != rooms[rname]:
+                expected = rooms[rname]
+                ok_pass = not expected
+                if expected:
+                    if ":" in expected:
+                        rsalt, rhash = expected.split(":", 1)
+                        ok_pass = hmac.compare_digest(hashlib.sha256((rsalt + pwd).encode("utf-8")).hexdigest(), rhash)
+                    else:
+                        ok_pass = hmac.compare_digest(hashlib.sha256(pwd.encode("utf-8")).hexdigest(), expected)
+                if not ok_pass:
                     send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Неверный пароль для " + rname))
                     return
                 client.room = rname
@@ -328,7 +427,7 @@ def handle_command(command, client):
 
     elif command == "/roommembers":
         with clients_lock:
-            parts = [f"{c.name}:{c.pub}" for c in clients if c.room == client.room and c.pub]
+            parts = [f"{c.name}:{c.pub}" for c in clients if c.room == client.room and c.authed and c.pub]
         send_frame(client_socket, TYPE_COMMAND, encrypt_message("[RESP]" + ";".join(parts)))
 
     elif command.startswith("/pubkey "):
@@ -336,7 +435,7 @@ def handle_command(command, client):
         pub = ""
         with clients_lock:
             for c in clients:
-                if c.name == name:
+                if c.name == name and c.authed and c.pub:
                     pub = c.pub
                     break
         send_frame(client_socket, TYPE_COMMAND, encrypt_message("[RESP]" + (pub or "ERR")))
