@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -128,6 +129,68 @@ func loadOrCreateIdentity() (*ecdh.PrivateKey, string) {
 	return priv, base64.StdEncoding.EncodeToString(pub)
 }
 
+// ── TOFU (Trust On First Use): защита от MITM ──────────
+// Отпечаток = SHA-256 публичного ключа. Ключи пиров запоминаются при первой
+// встрече; смена ключа пира — предупреждение (возможен MITM).
+
+func fingerprint(pubB64 string) string {
+	raw, err := base64.StdEncoding.DecodeString(pubB64)
+	if err != nil {
+		return "?"
+	}
+	h := sha256.Sum256(raw)
+	hexStr := hex.EncodeToString(h[:])
+	var groups []string
+	for i := 0; i < len(hexStr); i += 4 {
+		groups = append(groups, strings.ToUpper(hexStr[i:i+4]))
+	}
+	return strings.Join(groups, ":")
+}
+
+type tofuStore struct {
+	mu    sync.Mutex
+	known map[string]string // ник -> отпечаток
+}
+
+var tofu = &tofuStore{known: map[string]string{}}
+
+func loadTofu() {
+	for _, p := range candidatePaths("tofu.json") {
+		if data, err := os.ReadFile(p); err == nil {
+			_ = json.Unmarshal(data, &tofu.known)
+			return
+		}
+	}
+}
+
+func saveTofu() {
+	data, _ := json.MarshalIndent(tofu.known, "", "  ")
+	_ = os.WriteFile("tofu.json", data, 0600)
+}
+
+// checkTofu возвращает: new / ok / changed и предупреждает при смене ключа.
+func checkTofu(name, pubB64 string) string {
+	fp := fingerprint(pubB64)
+	tofu.mu.Lock()
+	defer tofu.mu.Unlock()
+	old, ok := tofu.known[name]
+	if !ok {
+		tofu.known[name] = fp
+		saveTofu()
+		return "new"
+	}
+	if old == fp {
+		return "ok"
+	}
+	pprint("=" + strings.Repeat("=", 58))
+	pprint(fmt.Sprintf("⚠️  ВНИМАНИЕ! Публичный ключ '%s' ИЗМЕНИЛСЯ!", name))
+	pprint("    Был:  " + old)
+	pprint("    Стал: " + fp)
+	pprint("    Возможна атака MITM или переустановка identity.")
+	pprint(fmt.Sprintf("    Если это ожидаемо — подтверди: /trust %s", name))
+	return "changed"
+}
+
 func deriveKey(priv *ecdh.PrivateKey, peerPubB64 string) []byte {
 	pubBytes, err := base64.StdEncoding.DecodeString(peerPubB64)
 	if err != nil {
@@ -214,6 +277,7 @@ func (c *Client) insertKeys(text string) {
 		item = strings.TrimSpace(item)
 		if i := strings.Index(item, ":"); i >= 0 {
 			c.known[item[:i]] = item[i+1:]
+			checkTofu(item[:i], item[i+1:])
 		}
 	}
 }
@@ -404,6 +468,7 @@ func (c *Client) recipientPub(target string) string {
 	resp := c.request("/pubkey " + target)
 	if resp != "" && resp != "ERR" {
 		c.known[target] = resp
+		checkTofu(target, resp)
 		return resp
 	}
 	return ""
@@ -432,6 +497,7 @@ func (c *Client) roomTargets() [][2]string {
 			n := item[:i]
 			p := item[i+1:]
 			c.known[n] = p
+			checkTofu(n, p)
 			if n != c.name {
 				out = append(out, [2]string{n, p})
 			}
@@ -505,6 +571,7 @@ func loadHostPort() (string, string) {
 
 func main() {
 	sharedKey = loadSharedKey()
+	loadTofu()
 	host, port := loadHostPort()
 	priv, pubB64 := loadOrCreateIdentity()
 
@@ -569,6 +636,29 @@ func main() {
 			if c.sendTo(target, text) {
 				pprint("[Я] -> " + target + ": " + text)
 			}
+		} else if strings.HasPrefix(msg, "/trust ") {
+			name := strings.TrimSpace(strings.TrimPrefix(msg, "/trust "))
+			if pub, ok := c.known[name]; ok {
+				tofu.mu.Lock()
+				tofu.known[name] = fingerprint(pub)
+				saveTofu()
+				fp := tofu.known[name]
+				tofu.mu.Unlock()
+				pprint("✅ Новый ключ " + name + " подтверждён: " + fp)
+			} else {
+				pprint("[ОШИБКА] Ключ для " + name + " неизвестен")
+			}
+		} else if msg == "/fingerprints" {
+			tofu.mu.Lock()
+			if len(tofu.known) == 0 {
+				pprint("[КЛЮЧИ] Пока никого. Ключи появятся после /users или первого сообщения.")
+			} else {
+				pprint("[КЛЮЧИ] Сохранённые отпечатки (TOFU):")
+				for n, fp := range tofu.known {
+					pprint("  " + n + ": " + fp)
+				}
+			}
+			tofu.mu.Unlock()
 		} else if strings.HasPrefix(msg, "/file ") {
 			path := strings.TrimSpace(strings.TrimPrefix(msg, "/file "))
 			c.sendFileToRoom(path)

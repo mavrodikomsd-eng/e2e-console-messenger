@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::path::Path;
@@ -172,6 +173,71 @@ struct State {
     pending: Mutex<Option<mpsc::Sender<String>>>,
 }
 
+// ── TOFU (Trust On First Use): защита от MITM ──────────
+// Отпечаток = SHA-256 публичного ключа; смена ключа пира — предупреждение.
+
+fn fingerprint(pub_b64: &str) -> String {
+    match B64.decode(pub_b64) {
+        Ok(raw) => {
+            let d = Sha256::digest(&raw);
+            let hexs: String = d.iter().map(|b| format!("{:02x}", b)).collect();
+            hexs
+                .as_bytes()
+                .chunks(4)
+                .map(|c| String::from_utf8_lossy(c).to_uppercase())
+                .collect::<Vec<_>>()
+                .join(":")
+        }
+        Err(_) => "?".to_string(),
+    }
+}
+
+fn load_tofu() -> HashMap<String, String> {
+    for p in candidate_paths("tofu.json") {
+        if let Ok(data) = std::fs::read_to_string(&p) {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&data) {
+                return map;
+            }
+        }
+    }
+    HashMap::new()
+}
+
+fn save_tofu(tofu: &HashMap<String, String>) {
+    if let Ok(json) = serde_json::to_string_pretty(tofu) {
+        let _ = write_file_secure(Path::new("tofu.json"), json.as_bytes());
+    }
+}
+
+/// Возвращает "new" / "ok" / "changed" и предупреждает при смене ключа.
+fn check_tofu(name: &str, pub_b64: &str) -> &'static str {
+    let fp = fingerprint(pub_b64);
+    let mut map = tofu().lock().unwrap();
+    match map.get(name).cloned() {
+        None => {
+            map.insert(name.to_string(), fp);
+            save_tofu(&map);
+            "new"
+        }
+        Some(old) if old == fp => "ok",
+        Some(old) => {
+            pprint("============================================================");
+            pprint(&format!("⚠️  ВНИМАНИЕ! Публичный ключ '{}' ИЗМЕНИЛСЯ!", name));
+            pprint(&format!("    Был:  {}", old));
+            pprint(&format!("    Стал: {}", fp));
+            pprint("    Возможна атака MITM или переустановка identity.");
+            pprint(&format!("    Если это ожидаемо — подтверди: /trust {}", name));
+            "changed"
+        }
+    }
+}
+
+static TOFU: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn tofu() -> &'static Mutex<HashMap<String, String>> {
+    TOFU.get_or_init(|| Mutex::new(load_tofu()))
+}
+
 fn insert_keys(state: &State, text: &str) {
     let body = match text.find(']') {
         Some(i) => &text[i + 1..],
@@ -182,6 +248,7 @@ fn insert_keys(state: &State, text: &str) {
         let item = item.trim();
         if let Some(idx) = item.find(':') {
             known.insert(item[..idx].to_string(), item[idx + 1..].to_string());
+            check_tofu(&item[..idx], &item[idx + 1..]);
         }
     }
 }
@@ -338,6 +405,7 @@ fn recipient_pub(stream: &mut TcpStream, state: &State, shared_key: &[u8; 32], n
     if let Some(resp) = request(stream, state, shared_key, &format!("/pubkey {}", name)) {
         if resp != "ERR" {
             state.known.lock().unwrap().insert(name.to_string(), resp.clone());
+            check_tofu(name, &resp);
             return Some(resp);
         }
     }
@@ -373,6 +441,7 @@ fn room_targets(stream: &mut TcpStream, state: &State, shared_key: &[u8; 32], us
                     let n = item[..idx].to_string();
                     let p = item[idx + 1..].to_string();
                     known.insert(n.clone(), p.clone());
+                    check_tofu(&n, &p);
                     if n != username {
                         out.push((n, p));
                     }
@@ -555,6 +624,28 @@ fn main() {
             }
         } else if let Some(rest) = msg.strip_prefix("/file ") {
             send_file_to_room(&mut stream, &state, &shared_key, &our, &pub_b64, &username, rest.trim());
+        } else if let Some(rest) = msg.strip_prefix("/trust ") {
+            let name = rest.trim();
+            let pubk = state.known.lock().unwrap().get(name).cloned();
+            match pubk {
+                Some(p) => {
+                    let fp = fingerprint(&p);
+                    tofu().lock().unwrap().insert(name.to_string(), fp.clone());
+                    save_tofu(&tofu().lock().unwrap());
+                    pprint(&format!("✅ Новый ключ {} подтверждён: {}", name, fp));
+                }
+                None => pprint(&format!("[ОШИБКА] Ключ для {} неизвестен", name)),
+            }
+        } else if msg == "/fingerprints" {
+            let map = tofu().lock().unwrap();
+            if map.is_empty() {
+                pprint("[КЛЮЧИ] Пока никого. Ключи появятся после /users или первого сообщения.");
+            } else {
+                pprint("[КЛЮЧИ] Сохранённые отпечатки (TOFU):");
+                for (n, fp) in map.iter() {
+                    pprint(&format!("  {}: {}", n, fp));
+                }
+            }
         } else if msg.starts_with('/') {
             if let Some(enc) = gcm_encrypt(&shared_key, msg.as_bytes(), b"") {
                 let _ = send_frame(&mut stream, TYPE_COMMAND, enc.as_bytes());

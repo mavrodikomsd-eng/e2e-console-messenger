@@ -13,6 +13,7 @@ from modules.crypto import (
 )
 from modules.config import config
 from modules.ui import show_banner
+from modules.tofu import TofuStore, fingerprint
 from modules.protocol import (
     send_frame,
     recv_frame,
@@ -43,6 +44,7 @@ class Client:
         self.seed_b64, self.pub_b64 = load_or_create_identity()
         self.authed = False
         self.known_keys = {}
+        self.tofu = TofuStore()
         self.pending_event = None
         self.pending_result = None
         self.recv = threading.Thread(target=self._reader, daemon=True)
@@ -65,6 +67,23 @@ class Client:
             if ":" in item:
                 n, p = item.split(":", 1)
                 self.known_keys[n] = p
+                self._tofu_check(n, p)
+
+    def _tofu_check(self, name, pub):
+        """TOFU-проверка ключа пира: предупреждает при смене ключа (возможен MITM)."""
+        status = self.tofu.check(name, pub)
+        fp = self.tofu.known.get(name, "")
+        if status == "new":
+            safe_print(f"🔑 {name}: новый ключ запомнен (отпечаток {fp[:19]}…)")
+        elif status == "changed":
+            safe_print("=" * 60)
+            safe_print(f"⚠️  ВНИМАНИЕ! Публичный ключ '{name}' ИЗМЕНИЛСЯ!")
+            safe_print(f"    Был:      {self.tofu.known.get(name)}")
+            safe_print(f"    Стал:     {fp}")
+            safe_print("    Это может быть атака MITM или переустановка identity.")
+            safe_print(f"    Если это ожидаемо — подтверди командой: /trust {name}")
+            safe_print("    Сообщения от этого пользователя НЕ будут расшифрованы доверенно!")
+            safe_print("=" * 60)
 
     def _resend_register(self):
         """Повторная регистрация публичного ключа после авторизации.
@@ -192,6 +211,7 @@ class Client:
             if resp and resp != "ERR":
                 pub = resp
                 self.known_keys[name] = pub
+                self._tofu_check(name, pub)
         return pub
 
     def send_to(self, target, text):
@@ -271,6 +291,22 @@ class Client:
                     target, text = parts[1], parts[2]
                     if self.send_to(target, text):
                         safe_print(f"[Я] -> {target}: {text}")
+                elif message.startswith("/trust "):
+                    name = message.split(maxsplit=1)[1].strip()
+                    pub = self.known_keys.get(name)
+                    if not pub:
+                        safe_print(f"[ОШИБКА] Ключ для {name} неизвестен")
+                    else:
+                        self.tofu.trust(name, pub)
+                        safe_print(f"✅ Новый ключ {name} подтверждён: {self.tofu.known[name]}")
+                elif message == "/fingerprints":
+                    if not self.tofu.known:
+                        safe_print("[КЛЮЧИ] Пока никого. Ключи появятся после /users или первого сообщения.")
+                    else:
+                        safe_print("[КЛЮЧИ] Сохранённые отпечатки (TOFU):")
+                        for n, fp in sorted(self.tofu.known.items()):
+                            mark = "✅" if self.known_keys.get(n) is None or fingerprint(self.known_keys[n]) == fp else "⚠️"
+                            safe_print(f"  {mark} {n}: {fp}")
                 elif message.startswith("/file "):
                     self.send_file_to_room(message.split(maxsplit=1)[1].strip())
                 elif message.startswith("/"):
