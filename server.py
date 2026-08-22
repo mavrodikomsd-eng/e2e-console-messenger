@@ -111,9 +111,26 @@ class Client:
         self.activated = False
         self.login_attempts = 0
         self.proto_version = 1
+        self.msg_times = []  # таймстампы сообщений для rate limit
+
+
+# ── Rate limit (анти-флуд): не более RATE_MAX сообщений за RATE_WINDOW секунд ──
+_rate_cfg = config.get("server", {}).get("rate_limit", {})
+RATE_MAX = int(_rate_cfg.get("max_messages", 30))
+RATE_WINDOW = float(_rate_cfg.get("window_seconds", 5))
+
+
+def check_rate(client):
+    """True — если клиент превысил лимит сообщений."""
+    import time as _time
+    now = _time.monotonic()
+    client.msg_times = [t for t in client.msg_times if now - t < RATE_WINDOW]
+    client.msg_times.append(now)
+    return len(client.msg_times) > RATE_MAX
 
 
 def log_message(username, message_preview):
+    """Пишет ТОЛЬКО метаданные события (без содержимого сообщений) + ротация."""
     logging_cfg = config.get("logging", {})
     if not logging_cfg.get("enabled", True):
         return
@@ -122,6 +139,12 @@ def log_message(username, message_preview):
     log_entry = f"[{timestamp}] {username}: {message_preview}"
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    except Exception:
+        pass
+    try:
+        # Ротация: не даём логу расти бесконечно
+        if os.path.exists(log_path) and os.path.getsize(log_path) > logging_cfg.get("max_bytes", 1_000_000):
+            os.replace(log_path, log_path + ".1")
     except Exception:
         pass
     with open(log_path, "a", encoding="utf-8") as f:
@@ -223,6 +246,13 @@ def handle_client(client_socket, client_address):
                 send_frame(client_socket, TYPE_COMMAND, encrypt_message(
                     "[AUTH]Сначала авторизуйтесь: /login ник пароль или /register ник пароль пароль"))
                 continue
+
+            # Анти-флуд: превышение лимита — предупреждение и отключение
+            if check_rate(client):
+                send_frame(client_socket, TYPE_COMMAND, encrypt_message(
+                    "[ОШИБКА] Слишком много сообщений. Соединение закрыто (анти-флуд)."))
+                print(f"[АНТИ-ФЛУД] {username} отключён (превышен лимит)")
+                break
 
             if frame_type == TYPE_VERSION:
                 ver = payload.decode("utf-8", errors="replace").strip()
@@ -463,7 +493,7 @@ def handle_command(command, client):
         send_frame(client_socket, TYPE_COMMAND, encrypt_message(f"\n[СТАТУС] Онлайн: {total}, комната: {client.room}"))
 
     elif command == "/about":
-        send_frame(client_socket, TYPE_COMMAND, encrypt_message("\nMeshMessenger v0.2\nЗащищённый мессенджер с E2E-шифрованием.\nОсновной сервер: Go."))
+        send_frame(client_socket, TYPE_COMMAND, encrypt_message("\n[О ПРОЕКТЕ] MeshMessenger v1.5\nЗащищённый мессенджер с E2E-шифрованием (X25519 + AES-256-GCM).\nОсновной сервер: Go."))
 
     elif command == "/clear":
         send_frame(client_socket, TYPE_COMMAND, encrypt_message("\n" * 50))
@@ -480,9 +510,9 @@ def handle_command(command, client):
             send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Неизвестная команда: " + command + ". Список команд: /help"))
 
 
-def start_server():
-    host = os.environ.get("MESH_HOST", config["server"]["host"])
-    port = int(os.environ.get("MESH_PORT", config["server"]["port"]))
+def start_server(host=None, port=None):
+    host = host or os.environ.get("MESH_HOST", config["server"]["host"])
+    port = port or int(os.environ.get("MESH_PORT", config["server"]["port"]))
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((host, port))
@@ -494,6 +524,9 @@ def start_server():
         while True:
             client_socket, client_address = server_socket.accept()
             set_tcp_nodelay(client_socket)
+            # Медленный/зависший клиент не должен держать поток вечно
+            idle_timeout = float(config.get("server", {}).get("idle_timeout", 600))
+            client_socket.settimeout(idle_timeout)
             thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
             thread.daemon = True
             thread.start()

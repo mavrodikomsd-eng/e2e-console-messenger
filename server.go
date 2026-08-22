@@ -41,7 +41,8 @@ type Client struct {
 	authed         bool
 	activated      bool
 	loginAttempts  int
-		protoVersion   int
+	protoVersion   int
+	msgTimes       []time.Time
 }
 
 var (
@@ -96,9 +97,42 @@ const (
 	keyFile = "secret.key"
 )
 
+// checkRate — анти-флуд: не более rateMaxMessages кадров за rateWindowSeconds.
+var (
+	rateMu           sync.Mutex
+	userMsgTimes     = map[string][]time.Time{}
+	rateMaxMessages  = 30
+	rateWindowSec    = 5
+)
+
+func checkRate(username string) bool {
+	rateMu.Lock()
+	defer rateMu.Unlock()
+	now := time.Now()
+	times := userMsgTimes[username][:0]
+	for _, t := range userMsgTimes[username] {
+		if now.Sub(t) < time.Duration(rateWindowSec)*time.Second {
+			times = append(times, t)
+		}
+	}
+	times = append(times, now)
+	userMsgTimes[username] = times
+	return len(times) > rateMaxMessages
+}
+
+func cleanupRate(username string) {
+	rateMu.Lock()
+	delete(userMsgTimes, username)
+	rateMu.Unlock()
+}
+
 func logMessage(username, messagePreview string) {
 	logMu.Lock()
 	defer logMu.Unlock()
+	// Ротация: не даём логу расти бесконечно
+	if st, err := os.Stat("messages.log"); err == nil && st.Size() > 1_000_000 {
+		_ = os.Rename("messages.log", "messages.log.1")
+	}
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	logEntry := fmt.Sprintf("[%s] %s: %s\n", timestamp, username, messagePreview)
 	f, err := os.OpenFile("messages.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -380,7 +414,7 @@ func handleClient(conn net.Conn, address string) {
 		sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Имя уже занято, выбери другое"))
 		return
 	}
-	clients = append(clients, &Client{conn: conn, address: address, username: username, room: "main"})
+	clients = append(clients, &Client{conn: conn, address: address, username: username, room: "main", msgTimes: make([]time.Time, 0, 32)})
 	clientsMutex.Unlock()
 
 	fmt.Printf("[ПОДКЛЮЧЕНИЕ] %s подключился с %s\n", username, address)
@@ -392,8 +426,17 @@ func handleClient(conn net.Conn, address string) {
 	sendFrameString(conn, typeCommand, encryptMessage(hint))
 
 	for {
+		// Медленный/зависший клиент не должен держать горутину вечно
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
 		frameType, payload, err := recvFrame(conn)
 		if err != nil {
+			break
+		}
+
+		// Анти-флуд: превышение лимита — предупреждение и отключение
+		if checkRate(username) {
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Слишком много сообщений. Соединение закрыто (анти-флуд)."))
+			fmt.Printf("[АНТИ-ФЛУД] %s отключён (превышен лимит)\n", username)
 			break
 		}
 
@@ -469,6 +512,7 @@ func handleClient(conn net.Conn, address string) {
 
 	leaveText := fmt.Sprintf("\n[СИСТЕМА] %s покинул чат", username)
 	broadcastToRoom(typeCommand, []byte(encryptMessage(leaveText)), nil, room)
+	cleanupRate(username)
 	fmt.Printf("[ОТКЛЮЧЕНИЕ] %s отключился\n", username)
 }
 
@@ -690,7 +734,7 @@ func handleCommand(command string, self *Client) {
 		sendFrameString(conn, typeCommand, encryptMessage("[RESP]" + strings.Join(parts, ";")))
 
 	case command == "/about":
-		sendFrameString(conn, typeCommand, encryptMessage("\nMeshMessenger v0.2\nЗащищённый мессенджер с E2E-шифрованием.\nОсновной сервер: Go."))
+		sendFrameString(conn, typeCommand, encryptMessage("\n[О ПРОЕКТЕ] MeshMessenger v1.5\nЗащищённый мессенджер с E2E-шифрованием (X25519 + AES-256-GCM).\nОсновной сервер: Go."))
 
 	case command == "/clear":
 		sendFrameString(conn, typeCommand, encryptMessage(strings.Repeat("\n", 50)))
@@ -707,20 +751,21 @@ func handleCommand(command string, self *Client) {
 	}
 }
 
-func loadConfig(filename string) *Config {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		fmt.Printf("Ошибка загрузки конфига: %v\n", err)
-		os.Exit(1)
+// loadConfig читает config.json; если его нет — fallback на legacy configs.json
+func loadConfig() *Config {
+	for _, filename := range []string{"config.json", "configs.json"} {
+		if data, err := os.ReadFile(filename); err == nil {
+			var cfg Config
+			if err := json.Unmarshal(data, &cfg); err != nil {
+				fmt.Printf("Ошибка парсинга JSON (%s): %v\n", filename, err)
+				os.Exit(1)
+			}
+			return &cfg
+		}
 	}
-
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		fmt.Printf("Ошибка парсинга JSON: %v\n", err)
-		os.Exit(1)
-	}
-
-	return &cfg
+	fmt.Println("Ошибка: не найден ни config.json, ни configs.json")
+	os.Exit(1)
+	return nil
 }
 
 func startServer(cfg *Config) {
@@ -740,7 +785,7 @@ func startServer(cfg *Config) {
 	defer listener.Close()
 
 	fmt.Printf("[СЕРВЕР] Запущен на %s:%d\n", host, port)
-	fmt.Println("[СЕРВЕР] Режим: E2E шифрование (сервер НЕ видит содержимое сообщений)\n")
+	fmt.Println("[СЕРВЕР] Режим: E2E шифрование (сервер НЕ видит содержимое сообщений)")
 
 	for {
 		conn, err := listener.Accept()
@@ -794,7 +839,7 @@ func loadOrCreateKey(cfg *Config) []byte {
 }
 
 func main() {
-	cfg := loadConfig("configs.json")
+	cfg := loadConfig()
 	encryptKey = loadOrCreateKey(cfg)
 	accounts = loadAccounts()
 
