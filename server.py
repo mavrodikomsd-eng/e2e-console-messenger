@@ -220,6 +220,8 @@ def handle_client(client_socket, client_address):
             frame_type, payload = frame
 
             if not client.authed and frame_type in (TYPE_MESSAGE, TYPE_FILE):
+                send_frame(client_socket, TYPE_COMMAND, encrypt_message(
+                    "[AUTH]Сначала авторизуйтесь: /login ник пароль или /register ник пароль пароль"))
                 continue
 
             if frame_type == TYPE_VERSION:
@@ -251,6 +253,7 @@ def handle_client(client_socket, client_address):
                 decrypted = decrypt_message(payload.decode("utf-8", errors="replace"))
                 if decrypted is None:
                     print(f"[!!] {username} отправил невалидную команду")
+                    send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Не удалось расшифровать команду. Проверьте, что у клиента и сервера одинаковый secret.key"))
                     continue
                 handle_command(decrypted, find_client(client_socket))
 
@@ -269,8 +272,16 @@ def handle_client(client_socket, client_address):
                     continue
                 _p = payload.split(b"\x00")
                 if len(_p) >= 2:
-                    client.pub = _p[1].decode("utf-8", errors="replace")
-                    activate(client)
+                    new_pub = _p[1].decode("utf-8", errors="replace")
+                    was_empty = not client.pub
+                    client.pub = new_pub
+                    if not client.activated:
+                        activate(client)
+                    elif was_empty:
+                        # Ключ пришёл только после авторизации (клиент шлёт R ещё раз).
+                        # Раздаём обновлённый ключ соседям, чтобы они могли писать нам.
+                        send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ПУБКЛЮЧИ]" + pubkeys_table()))
+                        broadcast_frame(TYPE_COMMAND, encrypt_message("[НОВЫЙ]" + client.name + ":" + client.pub), client_socket)
 
     except Exception:
         print("\n========== TRACEBACK ==========")
@@ -463,6 +474,10 @@ def handle_command(command, client):
 
     elif command == "/exit":
         client_socket.close()
+
+    else:
+        if command:
+            send_frame(client_socket, TYPE_COMMAND, encrypt_message("[ОШИБКА] Неизвестная команда: " + command + ". Список команд: /help"))
 
 
 def start_server():

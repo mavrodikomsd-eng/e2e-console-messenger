@@ -71,38 +71,52 @@ func recvFrame(conn net.Conn) (byte, []byte, error) {
 	return header[0], payload, nil
 }
 
+// candidatePaths возвращает пути к файлу в порядке проверки:
+// текущая рабочая папка, затем родительская (корень проекта).
+// Папка go_client запускается из go_client/, поэтому кроме "./secret.key"
+// ищем и "../secret.key", чтобы клиент использовал тот же ключ, что и сервер.
+func candidatePaths(name string) []string {
+	return []string{name, "../" + name}
+}
+
 func loadSharedKey() [32]byte {
-	path := os.Getenv("MESH_SHARED_KEY")
-	if path == "" {
-		path = "secret.key"
+	var paths []string
+	if e := os.Getenv("MESH_SHARED_KEY"); e != "" {
+		paths = append(paths, e)
 	}
-	if data, err := os.ReadFile(path); err == nil {
-		key, derr := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data)))
-		if derr == nil && len(key) == 32 {
-			var k [32]byte
-			copy(k[:], key)
-			return k
+	paths = append(paths, candidatePaths("secret.key")...)
+	for _, p := range paths {
+		if data, err := os.ReadFile(p); err == nil {
+			key, derr := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data)))
+			if derr == nil && len(key) == 32 {
+				var k [32]byte
+				copy(k[:], key)
+				return k
+			}
 		}
 	}
 	var key [32]byte
 	rand.Read(key[:])
-	os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(key[:])), 0600)
+	os.WriteFile(paths[len(paths)-1], []byte(base64.StdEncoding.EncodeToString(key[:])), 0600)
 	return key
 }
 
 func loadOrCreateIdentity() (*ecdh.PrivateKey, string) {
-	path := os.Getenv("MESH_IDENTITY_FILE")
-	if path == "" {
-		path = "identity.key"
+	var paths []string
+	if e := os.Getenv("MESH_IDENTITY_FILE"); e != "" {
+		paths = append(paths, e)
 	}
-	if data, err := os.ReadFile(path); err == nil {
-		parts := strings.Fields(string(data))
-		if len(parts) == 2 {
-			seed, err1 := base64.StdEncoding.DecodeString(parts[0])
-			pub, err2 := base64.StdEncoding.DecodeString(parts[1])
-			if err1 == nil && err2 == nil && len(seed) == 32 {
-				if priv, err := ecdh.X25519().NewPrivateKey(seed); err == nil {
-					return priv, base64.StdEncoding.EncodeToString(pub)
+	paths = append(paths, candidatePaths("identity.key")...)
+	for _, path := range paths {
+		if data, err := os.ReadFile(path); err == nil {
+			parts := strings.Fields(string(data))
+			if len(parts) == 2 {
+				seed, err1 := base64.StdEncoding.DecodeString(parts[0])
+				pub, err2 := base64.StdEncoding.DecodeString(parts[1])
+				if err1 == nil && err2 == nil && len(seed) == 32 {
+					if priv, err := ecdh.X25519().NewPrivateKey(seed); err == nil {
+						return priv, base64.StdEncoding.EncodeToString(pub)
+					}
 				}
 			}
 		}
@@ -110,7 +124,7 @@ func loadOrCreateIdentity() (*ecdh.PrivateKey, string) {
 	priv, _ := ecdh.X25519().GenerateKey(rand.Reader)
 	pub := priv.PublicKey().Bytes()
 	seed := priv.Bytes()
-	os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(seed)+" "+base64.StdEncoding.EncodeToString(pub)+"\n"), 0600)
+	os.WriteFile(paths[len(paths)-1], []byte(base64.StdEncoding.EncodeToString(seed)+" "+base64.StdEncoding.EncodeToString(pub)+"\n"), 0600)
 	return priv, base64.StdEncoding.EncodeToString(pub)
 }
 
@@ -338,6 +352,13 @@ func (c *Client) handleFile(payload []byte) {
 	pprint(fmt.Sprintf("[%s] отправил файл: %s (%d байт) — сохранён", sender, fname, len(raw)))
 }
 
+func (c *Client) reg() {
+	// Повторная регистрация публичного ключа после входа:
+	// сервер принимает кадр R только у аутентифицированных клиентов.
+	payload := []byte(c.name + "\x00" + c.selfPub)
+	_ = sendFrame(c.conn, typeRegister, payload)
+}
+
 func (c *Client) reader() {
 	for {
 		ftype, payload, err := recvFrame(c.conn)
@@ -361,6 +382,10 @@ func (c *Client) reader() {
 			}
 			if strings.HasPrefix(text, "[ПУБКЛЮЧИ]") || strings.HasPrefix(text, "[НОВЫЙ]") {
 				c.insertKeys(text)
+				continue
+			}
+			if strings.HasPrefix(text, "[AUTH]OK") {
+				c.reg()
 				continue
 			}
 			pprint(text)
@@ -515,6 +540,7 @@ func main() {
 	go c.reader()
 
 	pprint("Добро пожаловать, " + name + "!")
+	pprint("🔐 Авторизуйтесь: /login ник пароль или /register ник пароль пароль")
 	pprint("Команды: /join <комната> [пароль], /msg Имя текст, /file <путь>, /users, /rooms, /roommembers, /help, /exit")
 
 	for {

@@ -3,6 +3,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from modules.crypto import (
     encrypt_message,
     decrypt_message,
@@ -40,6 +41,7 @@ class Client:
         self.username = username
         self.connected = True
         self.seed_b64, self.pub_b64 = load_or_create_identity()
+        self.authed = False
         self.known_keys = {}
         self.pending_event = None
         self.pending_result = None
@@ -64,6 +66,25 @@ class Client:
                 n, p = item.split(":", 1)
                 self.known_keys[n] = p
 
+    def _resend_register(self):
+        """Повторная регистрация публичного ключа после авторизации.
+        Сервер принимает кадр R только у аутентифицированных клиентов, поэтому
+        после /register или /login нужно прислать ключ ещё раз, иначе сервер
+        не узнает публичный ключ и не сможет маршрутизировать сообщения."""
+        try:
+            send_frame(self.sock, TYPE_REGISTER,
+                       self.username.encode("utf-8") + b"\x00" + self.pub_b64.encode("utf-8"))
+        except Exception:
+            pass
+
+    def _wait_auth(self, timeout=2.0):
+        """Ожидает, пока сервер не подтвердит вход ([AUTH]OK). Используется после
+        ввода /login или /register, чтобы следующее сообщение случайно не ушло
+        «вхолостую» до того, как клиент узнал об успешной авторизации."""
+        t0 = time.time()
+        while not self.authed and self.connected and time.time() - t0 < timeout:
+            time.sleep(0.05)
+
     def _reader(self):
         while self.connected:
             try:
@@ -86,6 +107,16 @@ class Client:
                 if text.startswith("[ПУБКЛЮЧИ]") or text.startswith("[НОВЫЙ]"):
                     self._insert_keys(text)
                     continue
+                if text.startswith("[AUTH]OK"):
+                    # Вход выполнен — повторно регистрируем публичный ключ,
+                    # т.к. до авторизации сервер его игнорирует.
+                    self.authed = True
+                    self._resend_register()
+                    safe_print("✅ Авторизация успешна. Можно общаться!")
+                    continue
+                if text.startswith("[AUTH]") and "[AUTH]OK" not in text:
+                    # Ответ сервера о том, что вход ещё не выполнен/нужен.
+                    self.authed = False
                 safe_print(text)
             elif frame_type == TYPE_MESSAGE:
                 self._handle_message(payload)
@@ -164,6 +195,9 @@ class Client:
         return pub
 
     def send_to(self, target, text):
+        if not self.authed:
+            safe_print("[ВНИМАНИЕ] Сначала авторизуйтесь: /login ник пароль или /register ник пароль пароль")
+            return False
         pub = self._recipient_pub(target)
         if not pub or pub == "ERR":
             safe_print(f"[ОШИБКА] Не знаю публичный ключ для {target}")
@@ -187,6 +221,9 @@ class Client:
         return targets
 
     def send_to_room(self, text):
+        if not self.authed:
+            safe_print("[ВНИМАНИЕ] Сначала авторизуйтесь: /login ник пароль или /register ник пароль пароль")
+            return
         targets = self._room_targets()
         for name, pub in targets:
             ct = encrypt_to_peer(text, pub, self.pub_b64, self.seed_b64)
@@ -195,6 +232,9 @@ class Client:
         safe_print(f"[Я]: {text}")
 
     def send_file_to_room(self, path):
+        if not self.authed:
+            safe_print("[ВНИМАНИЕ] Сначала авторизуйтесь: /login ник пароль или /register ник пароль пароль")
+            return
         if not os.path.exists(path):
             safe_print("[ОШИБКА] Файл не найден:", path)
             return
@@ -235,6 +275,8 @@ class Client:
                     self.send_file_to_room(message.split(maxsplit=1)[1].strip())
                 elif message.startswith("/"):
                     send_frame(self.sock, TYPE_COMMAND, encrypt_message(message))
+                    if message.startswith("/login ") or message.startswith("/register "):
+                        self._wait_auth()
                 else:
                     self.send_to_room(message)
             except (ConnectionResetError, BrokenPipeError, OSError):
@@ -260,6 +302,9 @@ def start_client():
         send_frame(sock, TYPE_REGISTER, c.username.encode("utf-8") + b"\x00" + c.pub_b64.encode("utf-8"))
         print(f"\nДобро пожаловать, {username}!")
         print("Команды: /join <комната>, /msg Имя текст, /file <путь>, /users, /rooms, /roommembers, /help, /exit\n")
+        print("🔐 Перед общением нужно авторизоваться:")
+        print("   🔑 Уже есть аккаунт:  /login ник пароль")
+        print("   📝 Впервые:           /register ник пароль пароль")
         c.recv.start()
         c.send_messages()
     except ConnectionRefusedError:

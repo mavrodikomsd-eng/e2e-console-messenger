@@ -404,6 +404,7 @@ func handleClient(conn net.Conn, address string) {
 		}
 
 		if (frameType == typeMessage || frameType == typeFile) && (self == nil || !self.authed) {
+			sendFrameString(conn, typeCommand, encryptMessage("[AUTH]Сначала авторизуйтесь: /login ник пароль или /register ник пароль пароль"))
 			continue
 		}
 
@@ -426,6 +427,7 @@ func handleClient(conn net.Conn, address string) {
 			decrypted, err := decryptMessage(string(payload))
 			if err != nil {
 				fmt.Printf("[!!] %s отправил невалидную команду\n", username)
+				sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Не удалось расшифровать команду. Проверьте, что у клиента и сервера одинаковый secret.key"))
 				continue
 			}
 			handleCommand(decrypted, findClient(conn))
@@ -441,8 +443,15 @@ func handleClient(conn net.Conn, address string) {
 			}
 			parts := bytes.Split(payload, []byte{0})
 			if len(parts) >= 2 {
+				wasEmpty := self.pubkey == ""
 				self.pubkey = string(parts[1])
-				activate(self)
+				if !self.activated {
+					activate(self)
+				} else if wasEmpty {
+					// Ключ пришёл после авторизации (клиент шлёт R ещё раз). Раздаём обновлённый ключ.
+					sendFrameString(conn, typeCommand, encryptMessage("[ПУБКЛЮЧИ]"+pubKeysTable()))
+					broadcastFrame(typeCommand, []byte(encryptMessage("[НОВЫЙ]"+self.username+":"+self.pubkey)), conn)
+				}
 			}
 		}
 	}
@@ -691,6 +700,10 @@ func handleCommand(command string, self *Client) {
 
 	case command == "/exit":
 		conn.Close()
+	default:
+		if command != "" {
+			sendFrameString(conn, typeCommand, encryptMessage("[ОШИБКА] Неизвестная команда: " + command + ". Список команд: /help"))
+		}
 	}
 }
 

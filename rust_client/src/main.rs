@@ -60,29 +60,52 @@ fn recv_frame(stream: &mut TcpStream) -> io::Result<Option<(u8, Vec<u8>)>> {
     Ok(Some((header[0], payload)))
 }
 
+// candidate_paths подбирает пути, где искать файл: сначала текущая папка,
+// затем корень проекта (клиент обычно запускается из rust_client/).
+fn candidate_paths(name: &str) -> Vec<std::path::PathBuf> {
+    vec![
+        std::path::PathBuf::from(name),
+        std::path::PathBuf::from(format!("../{}", name)),
+    ]
+}
+
 fn load_shared_key() -> [u8; 32] {
-    let path = std::env::var("MESH_SHARED_KEY").unwrap_or_else(|_| "secret.key".into());
-    if let Ok(data) = std::fs::read_to_string(&path) {
-        if let Ok(key) = B64.decode(data.trim()) {
-            if let Ok(k) = <[u8; 32]>::try_from(key) {
-                return k;
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(e) = std::env::var("MESH_SHARED_KEY") {
+        paths.push(std::path::PathBuf::from(e));
+    }
+    paths.extend(candidate_paths("secret.key"));
+    for p in &paths {
+        if let Ok(data) = std::fs::read_to_string(p) {
+            if let Ok(key) = B64.decode(data.trim()) {
+                if let Ok(k) = <[u8; 32]>::try_from(key) {
+                    return k;
+                }
             }
         }
     }
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
-    let _ = write_file_secure(Path::new(&path), B64.encode(key).as_bytes());
+    if let Some(last) = paths.last() {
+        let _ = write_file_secure(Path::new(last), B64.encode(key).as_bytes());
+    }
     key
 }
 
 fn load_or_create_identity() -> (StaticSecret, Vec<u8>) {
-    let path = std::env::var("MESH_IDENTITY_FILE").unwrap_or_else(|_| "identity.key".into());
-    if let Ok(data) = std::fs::read_to_string(&path) {
-        let parts: Vec<&str> = data.split_whitespace().collect();
-        if parts.len() == 2 {
-            if let (Ok(seed), Ok(pubk)) = (B64.decode(parts[0]), B64.decode(parts[1])) {
-                if let Ok(s) = <[u8; 32]>::try_from(seed) {
-                    return (StaticSecret::from(s), pubk);
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(e) = std::env::var("MESH_IDENTITY_FILE") {
+        paths.push(std::path::PathBuf::from(e));
+    }
+    paths.extend(candidate_paths("identity.key"));
+    for p in &paths {
+        if let Ok(data) = std::fs::read_to_string(p) {
+            let parts: Vec<&str> = data.split_whitespace().collect();
+            if parts.len() == 2 {
+                if let (Ok(seed), Ok(pubk)) = (B64.decode(parts[0]), B64.decode(parts[1])) {
+                    if let Ok(s) = <[u8; 32]>::try_from(seed) {
+                        return (StaticSecret::from(s), pubk);
+                    }
                 }
             }
         }
@@ -91,7 +114,9 @@ fn load_or_create_identity() -> (StaticSecret, Vec<u8>) {
     rand::thread_rng().fill_bytes(&mut seed);
     let secret = StaticSecret::from(seed);
     let pub_bytes = PublicKey::from(&secret).to_bytes().to_vec();
-    let _ = write_file_secure(Path::new(&path), format!("{} {}\n", B64.encode(seed), B64.encode(&pub_bytes)).as_bytes());
+    if let Some(last) = paths.last() {
+        let _ = write_file_secure(Path::new(last), format!("{} {}\n", B64.encode(seed), B64.encode(&pub_bytes)).as_bytes());
+    }
     (secret, pub_bytes)
 }
 
@@ -268,7 +293,7 @@ fn handle_file(state: &State, our: &StaticSecret, payload: &[u8]) {
     }
 }
 
-fn reader_loop(mut stream: TcpStream, state: Arc<State>, our: Arc<StaticSecret>, shared_key: [u8; 32]) {
+fn reader_loop(mut stream: TcpStream, state: Arc<State>, our: Arc<StaticSecret>, shared_key: [u8; 32], username: String, pub_b64: String) {
     loop {
         match recv_frame(&mut stream) {
             Ok(Some((ftype, payload))) => {
@@ -284,6 +309,13 @@ fn reader_loop(mut stream: TcpStream, state: Arc<State>, our: Arc<StaticSecret>,
                         }
                         if text.starts_with("[ПУБКЛЮЧИ]") || text.starts_with("[НОВЫЙ]") {
                             insert_keys(&state, &text);
+                            continue;
+                        }
+                        if text.starts_with("[AUTH]OK") {
+                            // Вход выполнен — повторно регистрируем публичный ключ,
+                            // т.к. до авторизации сервер игнорирует кадр R.
+                            let reg = format!("{}\x00{}", username, pub_b64);
+                            let _ = send_frame(&mut stream, TYPE_REGISTER, reg.as_bytes());
                             continue;
                         }
                         pprint(&text);
@@ -480,9 +512,12 @@ fn main() {
     };
     let r_state = Arc::clone(&state);
     let r_our = Arc::clone(&our);
-    let _handle = std::thread::spawn(move || reader_loop(reader_stream, r_state, r_our, shared_key));
+    let r_user = username.clone();
+    let r_pub = pub_b64.clone();
+    let _handle = std::thread::spawn(move || reader_loop(reader_stream, r_state, r_our, shared_key, r_user, r_pub));
 
     pprint(&format!("Добро пожаловать, {}!", username));
+    pprint("🔐 Авторизуйтесь: /login ник пароль или /register ник пароль пароль");
     pprint("Команды: /join <комната>, /msg Имя текст, /file <путь>, /users, /rooms, /roommembers, /help, /exit");
 
     let auto_exit_ms: Option<u64> = std::env::var("MESH_AUTOEXIT_MS")
