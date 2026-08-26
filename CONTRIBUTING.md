@@ -7,7 +7,7 @@
 1. Форкни репозиторий
 2. Клонируй:
    ```bash
-   git clone https://github.com/TVOY_USERNAME/mesh.git
+   git clone [https://github.com/TVOY_USERNAME/mesh.git](https://github.com/mavrodikomsd-eng/e2e-console-messenger.git)
    ```
 3. Запусти сервер:
    ```bash
