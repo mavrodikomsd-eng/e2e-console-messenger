@@ -1,0 +1,18 @@
+{
+  "bren": {
+    "salt": "AUZDTO+Xqw3ziF/JbSjk6w",
+    "hash": "nphni5k+JQUY3LQWQlpMzv84w6c2SClQ85x321AG3xw",
+    "alg": "argon2id",
+    "memory": 65536,
+    "time": 2,
+    "threads": 1
+  },
+  "ton": {
+    "salt": "pzWuWCDw1BYwk0s/oYFwCQ",
+    "hash": "wYi2++I1Cm+CjWXa2hGuOSBtXknpqb7L8zOwb1e3be8",
+    "alg": "argon2id",
+    "memory": 65536,
+    "time": 2,
+    "threads": 1
+  }
+}

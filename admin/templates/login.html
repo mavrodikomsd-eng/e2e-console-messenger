@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MeshMessenger — Admin</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .card { background: #1e293b; border-radius: 12px; padding: 2rem; width: 360px; }
+        h1 { color: #38bdf8; margin-bottom: 1.5rem; text-align: center; }
+        input { width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; font-size: 14px; margin-bottom: 1rem; }
+        button { width: 100%; padding: 10px; border-radius: 8px; border: none; background: #38bdf8; color: #0f172a; font-size: 14px; font-weight: 600; cursor: pointer; }
+        button:hover { background: #7dd3fc; }
+        .error { color: #f87171; font-size: 13px; margin-bottom: 1rem; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>&#128737; Admin Panel</h1>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <form method="post" action="/login">
+            <input type="password" name="password" placeholder="Пароль администратора" autofocus>
+            <button type="submit">Войти</button>
+        </form>
+    </div>
+</body>
+</html>

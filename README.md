@@ -2,23 +2,23 @@
 
 # 🛡️ MeshMessenger
 
-### Сквозное шифрование. Слепой сервер. Пять языков.
+### Графический мессенджер с E2E-шифрованием. Self-hosted. Docker-ready.
 
 **X25519 · AES-256-GCM · Argon2id · TOFU**
 
-[![Version](https://img.shields.io/badge/version-1.5.0-38bdf8?style=for-the-badge)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.6.0-38bdf8?style=for-the-badge)](CHANGELOG.md)
 [![Changelog](https://img.shields.io/badge/📜_история_версий-8b5cf6?style=for-the-badge)](CHANGELOG.md)
-[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![Go](https://img.shields.io/badge/Go-1.18+-00ADD8?style=for-the-badge&logo=go&logoColor=black)](https://go.dev/)
 [![Rust](https://img.shields.io/badge/Rust-stable-DEA584?style=for-the-badge&logo=rust&logoColor=black)](https://rustup.rs/)
+[![Go](https://img.shields.io/badge/Go-1.18+-00ADD8?style=for-the-badge&logo=go&logoColor=black)](https://go.dev/)
+[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)](docker-compose.yml)
 [![Tests](https://img.shields.io/badge/tests-30_passing-22c55e?style=for-the-badge)](#-тесты)
 [![License](https://img.shields.io/badge/license-MIT-facc15?style=for-the-badge)](LICENSE)
 
 </div>
 
-> **Сервер — «слепой» ретранслятор.** Он видит только маршрутные имена и ни одного
-> сообщения: каждый текст шифруется отдельным ключом для каждого получателя,
-> а отпечатки ключей пиров защищают от подмены (TOFU).
+> **MeshMessenger** — self-hosted мессенджер с графическим интерфейсом в стиле Telegram Desktop.
+> Сервер — «слепой» ретранслятор: он видит только маршрутные имена, содержимое сообщений
+> защищено E2E-шифрованием (X25519 + AES-256-GCM). Запуск за минуту через Docker.
 
 ---
 
@@ -28,7 +28,9 @@
 |---|---|---|
 | 🔍 | [Как это работает](#-как-это-работает) | архитектура защиты за 30 секунд |
 | ✨ | [Возможности](#-возможности) | что умеет мессенджер |
+| 🖥️ | [Графический GUI](#-графический-gui) | Rust-клиент с rich UI |
 | 🏗️ | [Структура проекта](#️-структура-проекта) | что где лежит |
+| 🐳 | [Docker](#-docker) | запуск одной командой |
 | 🚀 | [Быстрый старт](#-быстрый-старт) | запустить за 5 минут |
 | ⌨️ | [Команды чата](#️-команды-чата) | полный справочник |
 | 🔐 | [Безопасность](#-безопасность) | криптография и хардненинг |
@@ -73,7 +75,7 @@
 5. Пароли аккаунтов хранятся как **Argon2id** (`accounts.json`, права 0600).
 
 ⚠️ **Ограничение:** используется статический ECDH — компрометация `identity.key`
-раскрывает прошлую переписку (нет forward secrecy). Осознанный компромисс v1.5.
+раскрывает прошлую переписку (нет forward secrecy). Осознанный компромисс v1.6.
 </details>
 
 ---
@@ -85,25 +87,43 @@
 - 🔒 **E2E AES-256-GCM** — per-recipient шифрование, встроенный контроль целостности.
 - 🛡️ **Защита от подмены имени** — AAD привязывает шифротекст к ключу отправителя.
 - 🕵️ **TOFU во всех клиентах** — отпечатки пиров, предупреждение при смене ключа, `/trust` / `/fingerprints`.
-- 🔐 **Аккаунты с паролями** — `/register` и `/login`, пароли как **argon2id**, лимит попыток входа.
+- 🔐 **Аккаунты с паролями** — регистрация и вход, пароли как **argon2id**, лимит попыток входа.
 
 ### 💬 Общение
-- 💬 Комнаты: `/createroom <имя> [пароль]`, `/join`, `/leave` — приватные комнаты с паролем.
-- 📂 Передача файлов `/file <путь>` — шифруется на каждого получателя.
-- 🤫 Личные сообщения `/msg Имя текст` — доставляются только адресату.
+- 💬 Комнаты: приватные комнаты с паролем.
+- 📂 Передача файлов — шифруется на каждого получателя.
+- 🤫 Личные сообщения — доставляются только адресату.
+- 🔍 **Поиск** по сообщениям и контактам.
+- 📅 **Группировка по датам** — «Сегодня», «Вчера», дата.
+- 😀 **Реакции** на сообщения (ПКМ → emoji).
+- ✍️ **Markdown** в сообщениях (`**жирный**`, `` `код` ``).
+- ✓✓ **Индикаторы прочтения** (отправлено / доставлено).
+
+### 🖥️ Графический GUI
+- 🎨 **Telegram Desktop-style** — тёмная тема, egui + Rust.
+- 🔔 **Windows toast-уведомления** о новых сообщениях.
+- 📌 **Трей-иконка** — работает в фоне.
+- 📥 **Экспорт чата** в .txt файл.
+- ⚡ **Быстрый вход** — сохранённые аккаунты, клик = вход без пароля.
+- 👥 **Личные чаты** в сайдбаре — всегда видны, с бейджами непрочитанных.
+- 📊 **Сортировка по активности** — кто последний писал, тот сверху.
+
+### 🐳 Деплой
+- 🐳 **Docker** — `docker-compose up` поднимает сервер + админ-панель.
+- 🌐 **Админ-панель** — FastAPI, дашборд, бан/разбан, статистика.
+- 📄 **Лендинг** — product-page для демонстрации.
 
 ### 🖥️ Реализации
 | Компонент | Язык | Назначение |
 |---|---|---|
-| `server.go` | 🐹 Go | **основной сервер** — производительный ретранслятор |
-| `server.py` | 🐍 Python | референсный сервер (удобен для разработки/тестов) |
+| `server_v2/` | 🐹 Go | **GUI-сервер** — SQLite, история, команда `/history` |
+| `server.go` | 🐹 Go | **CLI-сервер** — производительный ретранслятор |
+| `rust_gui/` | 🦀 Rust | **графический клиент** — egui, rich UI |
 | `client.py` | 🐍 Python | консольный клиент + модули (`modules/`) |
 | `go_client/` | 🐹 Go | CLI-клиент на stdlib |
 | `rust_client/` | 🦀 Rust | клиент без паник на битых данных |
-| `libmesh/` | 🔩 C | крипто-ядро (X25519, AES-GCM, argon2) для Python через FFI |
-| `web/server_web.py` | 🌐 Python | дашборд мониторинга: онлайн, пользователи, комнаты |
-
-> Дашборд видит **только метаданные** — содержимое сообщений недоступно по дизайну (E2E).
+| `admin/` | 🐍 Python | админ-панель (FastAPI) |
+| `landing/` | 🌐 HTML | product-page |
 
 ---
 
@@ -111,25 +131,49 @@
 
 ```
 mesh/
-├── server.go              # Основной сервер (Go)
-├── server.py              # Референсный сервер (Python)
-├── server_test.go         # Тесты Go-сервера
+├── server_v2/             # GUI-сервер (Go + SQLite)
+│   ├── main.go
+│   └── db.go
+├── server.go              # CLI-сервер (Go)
+├── rust_gui/              # Графический клиент (Rust + egui)
+│   ├── src/main.rs
+│   ├── Cargo.toml
+│   └── target/release/mesh_gui.exe
 ├── client.py              # Консольный клиент
 ├── modules/
 │   ├── crypto.py          # AES-GCM, X25519 ECDH, identity
 │   ├── protocol.py        # TCP-фрейминг [тип][длина][payload]
 │   ├── tofu.py            # TOFU-отпечатки ключей пиров
-│   ├── config.py          # Загрузчик настроек
-│   ├── libmesh_ffi.py     # Мост к C-ядру libmesh
-│   └── ui.py              # Баннеры интерфейса
+│   └── config.py          # Загрузчик настроек
 ├── tests/                 # 30 автотестов (unit + интеграционные)
 ├── go_client/main.go      # Go-клиент
 ├── rust_client/src/       # Rust-клиент
-├── libmesh/               # C-ядро криптографии
-├── web/server_web.py      # Веб-дашборд мониторинга
-├── config.json            # Общий конфиг (хост, порт, лимиты)
+├── admin/                 # Админ-панель (FastAPI)
+│   ├── main.py
+│   └── templates/
+├── landing/               # Product-page
+│   └── index.html
+├── Dockerfile             # Сервер (multi-stage)
+├── Dockerfile.admin       # Админ-панель
+├── docker-compose.yml     # Оркестрация
+├── config.json            # Конфиг (хост, порт, лимиты)
 └── CHANGELOG.md           # История версий
 ```
+
+---
+
+## 🐳 Docker
+
+```bash
+# Запуск сервера + админ-панели
+docker-compose up -d
+
+# Проверка
+curl http://localhost:1301    # сервер
+curl http://localhost:8080    # админ-панель
+```
+
+Сервер: `localhost:1301` · Админ: `localhost:8080` · Логин по умолчанию: `admin` / `admin`
 
 ---
 
@@ -146,7 +190,8 @@ go build server.go && ./server.exe      # или: python server.py
 
 ### 2️⃣ Подключение клиентов
 ```bash
-python client.py                        # или go_client/, или rust_client/
+python client.py                        # консольный
+# или запусти rust_gui/target/release/mesh_gui.exe
 ```
 
 ### 3️⃣ Регистрация и общение
@@ -177,7 +222,6 @@ python client.py                        # или go_client/, или rust_client/
 | `MESH_HOST` / `MESH_PORT` | адрес сервера |
 | `MESH_SHARED_KEY` | путь к `secret.key` |
 | `MESH_IDENTITY_FILE` | путь к `identity.key` |
-| `MESH_WEB_USER` / `MESH_WEB_PASS` | аккаунт веб-дашборда |
 </details>
 
 ---
@@ -192,6 +236,7 @@ python client.py                        # или go_client/, или rust_client/
 | `/createroom <имя> [пароль]` · `/join` · `/leave` | комнаты |
 | `/users` · `/rooms` · `/roommembers` | кто где |
 | `/pubkey <ник>` · `/fingerprints` · `/trust <ник>` | ключи и TOFU |
+| `/history` · `/serverstats` | история · статистика сервера |
 | `/status` · `/ping` · `/time` · `/about` · `/clear` · `/help` · `/exit` | прочее |
 
 ---
@@ -217,7 +262,7 @@ python client.py                        # или go_client/, или rust_client/
 ```bash
 python -m unittest discover tests    # 30 тестов: крипто, протокол, TOFU, интеграционные
 go test ./...                        # фрейминг, GCM, валидация (Go)
-cd rust_client && cargo build        # Rust-клиент собирается без warnings
+cd rust_gui && cargo build --release # GUI-клиент (Rust)
 ```
 Интеграционные тесты поднимают **реальный сервер** и прогоняют полный сценарий:
 регистрация двух клиентов → обмен E2E-сообщением → проверка анти-флуда.
@@ -227,10 +272,12 @@ cd rust_client && cargo build        # Rust-клиент собирается б
 ## 🤝 Вклад
 
 1. Форкни репозиторий и создай ветку.
-2. Проверь сборку своей части: `python -m py_compile client.py server.py`,
-   `go build server.go`, `cd rust_client && cargo build`.
+2. Проверь сборку своей части: `python -m py_compile client.py`,
+   `go build server.go`, `cd rust_gui && cargo build`.
 3. Опиши изменение в [CHANGELOG.md](CHANGELOG.md).
 4. Открой Pull Request.
+
+📖 Полные инструкции — в [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

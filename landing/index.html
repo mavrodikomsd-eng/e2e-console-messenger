@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MeshMessenger — Безопасный мессенджер для бизнеса</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0f1a; color: #e2e8f0; font-family: 'Segoe UI', system-ui, sans-serif; }
+        .hero { text-align: center; padding: 80px 20px 60px; }
+        .hero h1 { font-size: 3rem; color: #38bdf8; margin-bottom: 1rem; }
+        .hero p { color: #94a3b8; font-size: 1.2rem; max-width: 600px; margin: 0 auto 2rem; }
+        .badge-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 2rem; }
+        .badge { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 8px 16px; font-size: 13px; color: #94a3b8; }
+        .cta { display: inline-block; background: #38bdf8; color: #0a0f1a; padding: 14px 32px; border-radius: 10px; font-size: 16px; font-weight: 600; text-decoration: none; }
+        .cta:hover { background: #7dd3fc; }
+        .section { max-width: 900px; margin: 0 auto; padding: 60px 20px; }
+        .section h2 { color: #38bdf8; font-size: 2rem; margin-bottom: 1.5rem; text-align: center; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 24px; }
+        .card { background: #1e293b; border-radius: 12px; padding: 24px; }
+        .card h3 { color: #e2e8f0; margin-bottom: 8px; }
+        .card p { color: #94a3b8; font-size: 14px; line-height: 1.6; }
+        .code-block { background: #0f172a; border: 1px solid #1e293b; border-radius: 10px; padding: 20px; font-family: 'Cascadia Code', monospace; font-size: 14px; color: #4ade80; margin: 1rem 0; overflow-x: auto; }
+        .pricing { text-align: center; }
+        .price { font-size: 3rem; font-weight: 700; color: #38bdf8; }
+        .price span { font-size: 1rem; color: #64748b; }
+        .features-list { list-style: none; text-align: left; max-width: 500px; margin: 1rem auto; }
+        .features-list li { padding: 8px 0; color: #94a3b8; }
+        .features-list li::before { content: "✓ "; color: #4ade80; font-weight: bold; }
+        footer { text-align: center; padding: 40px 20px; color: #475569; font-size: 13px; border-top: 1px solid #1e293b; }
+    </style>
+</head>
+<body>
+
+<div class="hero">
+    <h1>&#128737; MeshMessenger</h1>
+    <p>Сквозное шифрование. Self-hosted. Под вашим брендом.</p>
+    <div class="badge-row">
+        <span class="badge">X25519 + AES-256-GCM</span>
+        <span class="badge">E2E шифрование</span>
+        <span class="badge">TOFU защита</span>
+        <span class="badge">Docker</span>
+    </div>
+    <a href="#deploy" class="cta">Развернуть за 2 минуты</a>
+</div>
+
+<div class="section">
+    <h2>Зачем вам свой мессенджер?</h2>
+    <div class="grid">
+        <div class="card">
+            <h3>&#128274; Полный контроль</h3>
+            <p>Данные на ваших серверах. Никаких третьих сторон. Соответствие GDPR, 152-ФЗ и корпоративным стандартам.</p>
+        </div>
+        <div class="card">
+            <h3>&#127760; Свой бренд</h3>
+            <p>Кастомные логин-экраны, цвета, лого. Ваши пользователи даже не узнают, что под капотом.</p>
+        </div>
+        <div class="card">
+            <h3>&#9889; Мгновенный деплой</h3>
+            <p>Одна команда Docker — и мессенджер работает. Не нужен DevOps-инженер.</p>
+        </div>
+    </div>
+</div>
+
+<div class="section" id="deploy">
+    <h2>Развернуть за 3 шага</h2>
+    <div class="code-block">
+# 1. Клонировать<br>
+git clone https://github.com/your-repo/mesh-messenger.git<br>
+cd mesh-messenger<br><br>
+# 2. Запустить<br>
+docker compose up -d<br><br>
+# 3. Готово!<br>
+Сервер: your-server:1301<br>
+Админка: http://your-server:8080
+    </div>
+</div>
+
+<div class="section">
+    <h2>Что внутри</h2>
+    <div class="grid">
+        <div class="card">
+            <h3>&#128187; Сервер (Go)</h3>
+            <p>Высокая производительность, низкое потребление памяти. Обрабатывает тысячи подключений.</p>
+        </div>
+        <div class="card">
+            <h3>&#128187; GUI-клиент (Rust + egui)</h3>
+            <p>Telegram-style интерфейс. Windows, Linux, macOS. Красивый и быстрый.</p>
+        </div>
+        <div class="card">
+            <h3>&#128202; Админ-панель</h3>
+            <p>Управление пользователями, статистика, блокировка. Всё через веб.</p>
+        </div>
+        <div class="card">
+            <h3>&#128274; E2E шифрование</h3>
+            <p>Сервер не видит содержимое сообщений. Только маршрутизация.</p>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Цены</h2>
+    <div class="pricing">
+        <div class="price">$0 <span>/ навсегда</span></div>
+        <p style="color:#94a3b8;margin:1rem 0">Open-source. Self-hosted. MIT-лицензия.</p>
+        <ul class="features-list">
+            <li>Без ограничений на пользователей</li>
+            <li>Без ежемесячных платежей</li>
+            <li>Исходный код включён</li>
+            <li>Кастомизация под ваш бренд</li>
+            <li>Техподдержка через Discord</li>
+        </ul>
+        <p style="color:#475569;margin-top:2rem;font-size:13px">Нужна помощь с деплоем? Напишите — поможем за вознаграждение.</p>
+    </div>
+</div>
+
+<footer>
+    MeshMessenger &copy; 2026 &middot; MIT License &middot; <a href="https://github.com" style="color:#38bdf8">GitHub</a>
+</footer>
+
+</body>
+</html>

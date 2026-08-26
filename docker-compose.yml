@@ -1,0 +1,35 @@
+services:
+  mesh-server:
+    build: .
+    container_name: mesh-server
+    ports:
+      - "1301:1301"
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads
+      - secret.key:/app/secret.key
+      - accounts.json:/app/accounts.json
+    environment:
+      - MESH_HOST=0.0.0.0
+      - MESH_PORT=1301
+    restart: unless-stopped
+
+  mesh-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile.admin
+    container_name: mesh-admin
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - accounts.json:/app/accounts.json
+    environment:
+      - MESH_WEB_PASS=admin123
+    restart: unless-stopped
+    depends_on:
+      - mesh-server
+
+volumes:
+  secret.key:
+  accounts.json:

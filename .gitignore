@@ -1,75 +1,68 @@
-# История сообщений
-messages.txt
-messages.log
+# ═══════════════════════════════════════════════════════
+# MeshMessenger .gitignore
+# ═══════════════════════════════════════════════════════
 
-# Секретный ключ шифрования
-secret.key
+# ── Бинарники Windows ──
+*.exe
 
-# Идентичность клиента (X25519)
+# ── Rust ──
+rust_gui/target/
+rust_client/target/
+**/target/
 
-# База аккаунтов сервера (пароли-хэши) — пользовательские данные, не для git
-accounts.json
+# ── Go ──
+go_client/mesh_go_client.exe
 
-# Python кэш
+# ── Python ──
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-
-# Виртуальное окружение
 venv/
 env/
 ENV/
+.venv/
 
-# IDE
+# ── Zig ──
+zig_client/zig-out/
+
+# ── Секреты и данные пользователя ──
+secret.key
+identity.key
+accounts.json
+tofu.json
+messages.txt
+messages.log
+
+# ── Загруженные файлы ──
+downloads/
+
+# ── Данные ──
+data/
+
+# ── IDE и редакторы ──
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
+.project
+.settings/
 
-# Системные файлы
+# ── Системные файлы ──
 Thumbs.db
+Desktop.ini
 .DS_Store
 *.log
 
-# Данные
-data/
+# ── Docker ──
+test_build/
 
-# Rust
-rust_client/target/
-
-# Go-клиент — сборочный бинарник
-go_client/mesh_go_client.exe
-
-
-
-# Рабочая папка для ИИ-агента
+# ── AI-агент (рабочие заметки, не для публикации) ──
 ai_agent/
 
-# Идентичность клиента (X25519)
-identity.key
-
-# Собранные бинарники / артефакты сборки в корне
-server.exe
-*.exe
-*.pdb
-*.dll
-
-# Загруженные файлы (персональные данные пользователя)
-downloads/
-
-# TOFU-хранилище отпечатков публичных ключей (персональные данные)
-tofu.json
-
-# Zig-клиент — сборочные артефакты (исходники .zig из репозитория оставляем)
-zig_client/zig-out/
-zig_client/*.pdb
-
-# Временные эксперименты/заглушки (не часть проекта)
+# ── Временные эксперименты ──
 _xc*
 _hst*
 _rt*
 _scratch*
 *xc_probe*
-
-# Веб-интерфейс — дашборд мониторинга является частью проекта

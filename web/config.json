@@ -1,0 +1,16 @@
+{
+    "server": {
+        "host": "localhost",
+        "port": 1301,
+        "max_clients": 100
+    },
+
+    "logging": {
+        "enabled": true,
+        "file": "data/logs/messages.log"
+    },
+
+    "client": {
+        "auto_reconnect": true
+    }
+}
