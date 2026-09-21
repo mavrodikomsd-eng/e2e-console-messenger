@@ -6,7 +6,7 @@
 
 **X25519 · AES-256-GCM · Argon2id · TOFU**
 
-[![Version](https://img.shields.io/badge/version-1.6.0-38bdf8?style=for-the-badge)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.6.1-38bdf8?style=for-the-badge)](CHANGELOG.md)
 [![Changelog](https://img.shields.io/badge/📜_история_версий-8b5cf6?style=for-the-badge)](CHANGELOG.md)
 [![Rust](https://img.shields.io/badge/Rust-stable-DEA584?style=for-the-badge&logo=rust&logoColor=black)](https://rustup.rs/)
 [![Go](https://img.shields.io/badge/Go-1.18+-00ADD8?style=for-the-badge&logo=go&logoColor=black)](https://go.dev/)

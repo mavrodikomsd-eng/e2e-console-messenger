@@ -20,6 +20,7 @@ pub fn write_file_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -30,8 +31,27 @@ pub fn write_file_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, data)
+        std::fs::write(path, data)?;
+        restrict_to_current_user(path);
+        Ok(())
     }
+}
+
+/// Windows: best-effort ACL — только текущий пользователь (было: файл читаем всеми).
+/// Ошибки игнорируются (нет прав / не NTFS), файл уже записан.
+#[cfg(windows)]
+fn restrict_to_current_user(path: &Path) {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    if user.is_empty() {
+        return;
+    }
+    let grant = format!("{}:F", user);
+    let _ = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(&grant)
+        .output();
 }
 
 pub fn load_shared_key() -> [u8; 32] {
@@ -115,7 +135,7 @@ pub fn load_tofu() -> HashMap<String, String> {
 pub fn save_tofu(map: &HashMap<String, String>) {
     if let Ok(json) = serde_json::to_string_pretty(map) {
         for p in candidate_paths("tofu.json") {
-            let _ = std::fs::write(&p, json.as_bytes());
+            let _ = write_file_secure(&p, json.as_bytes());
             break;
         }
     }

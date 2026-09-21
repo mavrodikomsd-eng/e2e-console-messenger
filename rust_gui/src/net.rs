@@ -28,10 +28,11 @@ pub enum UiCmd {
     CreateRoom { room: String, pass: String },
     Leave,
     Typing(String),
-    Room(String),
+    Room { room: String, text: String },
     Priv { target: String, text: String },
-    File(String),
+    File { target: String, is_room: bool, path: String },
     Trust(String),
+    Reaction { target_chat: String, is_room: bool, emoji: String, target_text: String },
 }
 
 pub enum Ev {
@@ -55,9 +56,12 @@ pub enum Ev {
     /// @user печатает
     Typing { from: String },
     /// Личное/комнатное сообщение от пира (уже расшифровано).
-    Msg { from: String, text: String },
+    /// room: None — личное, Some(имя комнаты) — из комнаты.
+    Msg { from: String, text: String, room: Option<String> },
     /// Входящий файл.
-    FileMsg { from: String, name: String },
+    FileMsg { from: String, name: String, room: Option<String> },
+    /// Реакция на сообщение.
+    Reaction { emoji: String, target_text: String, room: Option<String> },
 }
 
 struct NetState {
@@ -158,12 +162,29 @@ fn handle_message(st: &NetState, our: &StaticSecret, payload: &[u8]) {
         return;
     }
     let sender = String::from_utf8_lossy(parts[0]).to_string();
+    let room: Option<String> = if parts.len() >= 4 {
+        let r = String::from_utf8_lossy(parts[3]).trim().to_string();
+        if r.is_empty() { None } else { Some(r) }
+    } else {
+        None
+    };
     let ct = String::from_utf8_lossy(parts[2]).to_string();
     match st.known.lock().unwrap().get(&sender).cloned() {
         None => emit(&st.tx, format!("[{}]: (неизвестный публичный ключ)", sender)),
         Some(pk) => match decrypt_from_peer(&ct, &pk, our) {
             Some(plain) => {
-                let _ = st.tx.send(Ev::Msg { from: sender, text: plain.trim_end().to_string() });
+                let text = plain.trim_end().to_string();
+                if let Some(rest) = text.strip_prefix("__REACTION__:") {
+                    if let Some((emoji, target)) = rest.split_once(':') {
+                        let _ = st.tx.send(Ev::Reaction {
+                            emoji: emoji.to_string(),
+                            target_text: target.to_string(),
+                            room,
+                        });
+                    }
+                } else {
+                    let _ = st.tx.send(Ev::Msg { from: sender, text, room });
+                }
             }
             None => {
                 let _ = st.tx.send(Ev::Error(format!("[{}]: не удалось расшифровать (подмена/ключ)", sender)));
@@ -179,6 +200,12 @@ fn handle_file(st: &NetState, our: &StaticSecret, payload: &[u8]) {
     }
     let sender = String::from_utf8_lossy(parts[0]).to_string();
     let fname = String::from_utf8_lossy(parts[2]).to_string();
+    let room: Option<String> = if parts.len() >= 5 {
+        let r = String::from_utf8_lossy(parts[4]).trim().to_string();
+        if r.is_empty() { None } else { Some(r) }
+    } else {
+        None
+    };
     let data = String::from_utf8_lossy(parts[3]).to_string();
     match st.known.lock().unwrap().get(&sender).cloned() {
         None => emit(&st.tx, format!("[{}] отправил файл {}, но ключ неизвестен", sender, fname)),
@@ -197,7 +224,7 @@ fn handle_file(st: &NetState, our: &StaticSecret, payload: &[u8]) {
                 });
             match got {
                 Some(base) => {
-                    let _ = st.tx.send(Ev::FileMsg { from: sender, name: base });
+                    let _ = st.tx.send(Ev::FileMsg { from: sender, name: base, room });
                 }
                 None => {
                     let _ = st.tx.send(Ev::Error(format!("[{}] файл {} получить не удалось", sender, fname)));
@@ -479,16 +506,17 @@ pub fn net_loop(
                     )));
                 }
             }
-            UiCmd::Room(text) => {
+            UiCmd::Room { room, text } => {
                 for (name, pubk) in room_targets(&mut stream, &st, &shared_key, &username) {
                     if let Some(ct) = encrypt_to_peer(&text, &pubk, &pub_b64, &our) {
-                        let payload = format!("{}\x00{}\x00{}", username, name, ct);
+                        // 4-е поле — имя комнаты, чтобы получатель знал, куда показать сообщение
+                        let payload = format!("{}\x00{}\x00{}\x00{}", username, name, ct, room);
                         let _ = send_frame(&mut stream, TYPE_MESSAGE, payload.as_bytes());
                     }
                 }
                 emit(&st.tx, format!("[Я]: {}", text));
             }
-            UiCmd::File(path) => match std::fs::read(&path) {
+            UiCmd::File { target, is_room, path } => match std::fs::read(&path) {
                 Err(_) => {
                     let _ = st.tx.send(Ev::Error(format!("Файл не найден: {}", path)));
                 }
@@ -501,13 +529,63 @@ pub fn net_loop(
                 Ok(raw) => {
                     let fname = path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string();
                     let b64 = B64.encode(&raw);
-                    for (name, pubk) in room_targets(&mut stream, &st, &shared_key, &username) {
-                        if let Some(ct) = encrypt_to_peer(&b64, &pubk, &pub_b64, &our) {
-                            let payload = format!("{}\x00{}\x00{}\x00{}", username, name, fname, ct);
-                            let _ = send_frame(&mut stream, TYPE_FILE, payload.as_bytes());
+                    if is_room {
+                        for (name, pubk) in room_targets(&mut stream, &st, &shared_key, &username) {
+                            if let Some(ct) = encrypt_to_peer(&b64, &pubk, &pub_b64, &our) {
+                                let payload = format!("{}\x00{}\x00{}\x00{}\x00{}", username, name, fname, ct, target);
+                                let _ = send_frame(&mut stream, TYPE_FILE, payload.as_bytes());
+                            }
+                        }
+                        emit(&st.tx, format!("[Я] файл {} отправлен в комнату", fname));
+                    } else {
+                        let sent = recipient_pub(&mut stream, &st, &shared_key, &target)
+                            .and_then(|pubk| encrypt_to_peer(&b64, &pubk, &pub_b64, &our))
+                            .map(|ct| format!("{}\x00{}\x00{}\x00{}", username, target, fname, ct))
+                            .map(|payload| send_frame(&mut stream, TYPE_FILE, payload.as_bytes()).is_ok())
+                            .unwrap_or(false);
+                        if sent {
+                            emit(&st.tx, format!("[Я] файл {} отправлен для {}", fname, target));
+                        } else {
+                            let _ = st.tx.send(Ev::Error(format!(
+                                "Не удалось отправить файл для {} (нет ключа?)",
+                                target
+                            )));
                         }
                     }
-                    emit(&st.tx, format!("[Я] файл {} отправлен в комнату", fname));
+                }
+            },
+            UiCmd::Reaction { target_chat, is_room, emoji, target_text } => {
+                let reaction_text = format!("__REACTION__:{}:{}", emoji, target_text);
+                if is_room {
+                    for (name, pubk) in room_targets(&mut stream, &st, &shared_key, &username) {
+                        if let Some(ct) = encrypt_to_peer(&reaction_text, &pubk, &pub_b64, &our) {
+                            let payload = format!("{}\x00{}\x00{}\x00{}", username, name, ct, target_chat);
+                            let _ = send_frame(&mut stream, TYPE_MESSAGE, payload.as_bytes());
+                        }
+                    }
+                    // Локальное эхо: автор сразу видит свою реакцию
+                    let _ = st.tx.send(Ev::Reaction {
+                        emoji: emoji.clone(),
+                        target_text: target_text.clone(),
+                        room: Some(target_chat.clone()),
+                    });
+                } else {
+                    let sent = recipient_pub(&mut stream, &st, &shared_key, &target_chat)
+                        .and_then(|pubk| encrypt_to_peer(&reaction_text, &pubk, &pub_b64, &our))
+                        .map(|ct| format!("{}\x00{}\x00{}", username, target_chat, ct))
+                        .map(|payload| send_frame(&mut stream, TYPE_MESSAGE, payload.as_bytes()).is_ok())
+                        .unwrap_or(false);
+                    if sent {
+                        let _ = st.tx.send(Ev::Reaction {
+                            emoji: emoji.clone(),
+                            target_text: target_text.clone(),
+                            room: None,
+                        });
+                    } else {
+                        let _ = st.tx.send(Ev::Error(format!(
+                            "Не удалось отправить реакцию для {}", target_chat
+                        )));
+                    }
                 }
             },
         }

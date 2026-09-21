@@ -533,10 +533,17 @@ func handleClient(conn net.Conn, address string) {
 			broadcastToRoom(typeMessage, payload, conn, room)
 			fmt.Printf("[%s]: (E2E сообщение → комната %s)\n", username, room)
 		} else if frameType == typeFile {
-			logMessage(username, "(файл)")
-			dbSaveMessage(username, room, string(payload), "file")
-			broadcastToRoom(typeFile, payload, conn, room)
-			fmt.Printf("[%s]: (файл → комната %s)\n", username, room)
+			parts := bytes.Split(payload, []byte{0})
+			if len(parts) >= 3 && len(parts[1]) > 0 {
+				target := strings.TrimSpace(string(parts[1]))
+				logMessage(username, "(file for "+target+")")
+				sendToUsername(typeFile, payload, conn, target)
+			} else {
+				logMessage(username, "(file)")
+				dbSaveMessage(username, room, string(payload), "file")
+				broadcastToRoom(typeFile, payload, conn, room)
+			}
+			fmt.Printf("[%s]: (файл → %s)\n", username, room)
 		} else if frameType == typeCommand {
 			decrypted, err := decryptMessage(string(payload))
 			if err != nil {

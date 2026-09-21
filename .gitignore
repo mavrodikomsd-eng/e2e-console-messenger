@@ -29,6 +29,7 @@ zig_client/zig-out/
 secret.key
 identity.key
 accounts.json
+*.bak
 tofu.json
 messages.txt
 messages.log

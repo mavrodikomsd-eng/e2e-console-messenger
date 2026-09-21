@@ -66,15 +66,18 @@
                 <td>
                     {% if acc.get("banned") %}
                     <form method="post" action="/unban/{{ username }}" style="display:inline">
+                        <input type="hidden" name="csrf" value="{{ csrf }}">
                         <button class="btn btn-unban">Разбанить</button>
                     </form>
                     {% else %}
                     <form method="post" action="/ban/{{ username }}" style="display:inline">
+                        <input type="hidden" name="csrf" value="{{ csrf }}">
                         <button class="btn btn-ban">Забанить</button>
                     </form>
                     {% endif %}
                     <form method="post" action="/delete/{{ username }}" style="display:inline"
                           onsubmit="return confirm('Удалить {{ username }}?')">
+                        <input type="hidden" name="csrf" value="{{ csrf }}">
                         <button class="btn btn-del">Удалить</button>
                     </form>
                 </td>

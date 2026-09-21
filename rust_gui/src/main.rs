@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use net::{Ev, UiCmd};
-use store::{load_or_create_identity, load_shared_key, tofu};
+use store::{load_or_create_identity, load_shared_key, tofu, write_file_secure};
 
 // ── Сохранённые аккаунты ──
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -41,8 +41,15 @@ fn load_accounts() -> Vec<SavedAccount> {
 
 fn save_accounts(accounts: &[SavedAccount]) {
     let path = accounts_path();
-    let _ = std::fs::create_dir_all(path.parent().unwrap());
-    let _ = std::fs::write(&path, serde_json::to_string_pretty(accounts).unwrap());
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Приватный файл: Unix 0600, Windows — ACL только текущий пользователь.
+    // ВНИМАНИЕ: здесь лежат пароли для быстрого входа — любой с доступом к ПК
+    // может их прочитать. Не включайте «запомнить», если ПК не ваш.
+    if let Ok(json) = serde_json::to_string_pretty(accounts) {
+        let _ = write_file_secure(&path, json.as_bytes());
+    }
 }
 
 fn save_account(acc: &SavedAccount) {
@@ -71,8 +78,38 @@ const DIVIDER: egui::Color32 = egui::Color32::from_rgb(16, 25, 33);
 const ONLINE: egui::Color32 = egui::Color32::from_rgb(77, 205, 94); // #4dcd5e
 const TIME_IN_BUBBLE: egui::Color32 = egui::Color32::from_rgb(160, 180, 200);
 
+const APP_VERSION: &str = "v1.6.1";
+
 const SYS_CHAT: &str = "\u{1f4e1} Сервер";
 const ROOM_CHAT: &str = "# Общая комната";
+
+/// Имя комнаты протокола по ID чата GUI (для «Общая комната» → "main" на сервере).
+fn room_name_of(chat_id: &str) -> String {
+    if chat_id == ROOM_CHAT {
+        "main".to_string()
+    } else {
+        chat_id.trim_start_matches('#').trim().to_string()
+    }
+}
+
+/// Маппинг имени комнаты протокола → ID чата GUI.
+fn room_chat_id(room: &str) -> String {
+    if room == "main" {
+        ROOM_CHAT.to_string()
+    } else {
+        format!("# {}", room)
+    }
+}
+
+/// Открытое меню реакций (ПКМ по пузырю): рисуется ОДИН раз в фикс. позиции клика.
+// Раньше Area рисовалась всегда у курсора и перехватывала все клики.
+struct ReactionMenu {
+    chat_id: String,
+    is_room: bool,
+    target_text: String,
+    pos: egui::Pos2,
+    rect: Option<egui::Rect>, // rect прошлого кадра — для закрытия кликом мимо
+}
 
 #[derive(Clone)]
 struct Msg {
@@ -86,22 +123,28 @@ struct Msg {
     read: bool,
 }
 
-/// Windows toast-уведомление через PowerShell
+/// Windows toast-уведомление через PowerShell.
+/// Безопасность: заголовок и текст передаются через $args (argv), а НЕ вшиваются
+/// в тело скрипта — инъекция PowerShell-кода из чужого сообщения невозможна.
+/// В XML дополнительно эскейпим &<>"'.
 #[cfg(target_os = "windows")]
 fn toast_notify(title: &str, body: &str) {
-    let script = format!(
-        r#"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
+    fn xml_esc(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+            .replace('"', "&quot;").replace('\'', "&apos;")
+    }
+    let script = r#"$t = $args[0]; $b = $args[1]; \
+         [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
          [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null; \
-         $template = '<toast><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text></binding></visual></toast>'; \
+         $template = '<toast><visual><binding template="ToastGeneric"><text>{0}</text><text>{1}</text></binding></visual></toast>' -f $t, $b; \
          $xml = New-Object Windows.Data.Xml.Dom.XmlDocument; \
          $xml.LoadXml($template); \
          $toast = [Windows.UI.Notifications.ToastNotification]::new($xml); \
-         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("MeshMessenger").Show($toast)"#,
-        title.replace('<', "&lt;").replace('>', "&gt;"),
-        body.replace('<', "&lt;").replace('>', "&gt;")
-    );
+         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("MeshMessenger").Show($toast)"#;
     let _ = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
+        .arg(xml_esc(title))
+        .arg(xml_esc(body))
         .spawn();
 }
 
@@ -234,6 +277,7 @@ struct MeshApp {
     me: String, // мой @username
     my_nick: String,
     my_bio: String,
+    current_room: String, // комната на сервере (self.room) — по умолчанию "main"
     // ── Чаты ──
     chats: Vec<Chat>,
     active: usize,
@@ -266,6 +310,11 @@ struct MeshApp {
     connect_error: Option<String>,
     // сохранённые аккаунты для быстрого входа
     saved_accounts: Vec<SavedAccount>,
+    // запоминать ли пароль для быстрого входа (по умолчанию ВЫКЛ — пароль на диске
+    // может прочитать любой с доступом к ПК)
+    remember_me: bool,
+    // открытое меню реакций (None = закрыто)
+    reaction_menu: Option<ReactionMenu>,
 }
 
 enum Screen {
@@ -295,6 +344,7 @@ impl Default for MeshApp {
             me: String::new(),
             my_nick: String::new(),
             my_bio: String::new(),
+            current_room: "main".to_string(),
             chats,
             active: 0,
             search: String::new(),
@@ -320,6 +370,8 @@ impl Default for MeshApp {
             whois: None,
             connect_error: None,
             saved_accounts: load_accounts(),
+            remember_me: false,
+            reaction_menu: None,
         };
         // Демо-сообщения, чтобы видеть вёрстку пузырей до подключения.
         let t = now_hhmm();
@@ -463,15 +515,25 @@ impl MeshApp {
                     self.authed = true;
                     self.connect_error = None;
                     self.screen = Screen::Chat;
-                    // Сохраняем аккаунт для быстрого входа
+                    // Быстрый вход — ТОЛЬКО с согласия (чекбокс). Иначе стираем
+                    // возможный старый сохранённый пароль этого аккаунта.
                     let pass = self.password.clone();
                     self.password.clear();
-                    save_account(&SavedAccount {
-                        username: self.me.clone(),
-                        password: pass,
-                        host: self.host.clone(),
-                        port: self.port.clone(),
-                    });
+                    if self.remember_me && !pass.is_empty() {
+                        save_account(&SavedAccount {
+                            username: self.me.clone(),
+                            password: pass,
+                            host: self.host.clone(),
+                            port: self.port.clone(),
+                        });
+                    } else {
+                        let mut accounts = load_accounts();
+                        let before = accounts.len();
+                        accounts.retain(|a| !(a.username == self.me && a.host == self.host && a.port == self.port));
+                        if accounts.len() != before {
+                            save_accounts(&accounts);
+                        }
+                    }
                     self.saved_accounts = load_accounts();
                     self.push_msg(SYS_CHAT, false, false, "система", "✅ Вход выполнен. Можно общаться!", 0);
                     self.send_ui(UiCmd::RefreshUsers);
@@ -527,33 +589,82 @@ impl MeshApp {
                     self.push_msg(SYS_CHAT, false, false, "система", "✅ Пароль изменён", 0);
                 }
                 Ev::RoomChanged(room) => {
-                    let id = format!("# {}", room);
+                    self.current_room = room.clone();
+                    let id = room_chat_id(&room);
                     let idx = self.chat_index(&id, true);
                     self.active = idx;
                     self.chats[idx].unread = 0;
-                    self.push_msg(SYS_CHAT, false, false, "система", &format!("Вы вошли в комнату {}", room), 0);
+                    let label = if room == "main" { "общей комнате".to_string() } else { format!("комнате {}", room) };
+                    self.push_msg(SYS_CHAT, false, false, "система", &format!("Вы вошли в {}", label), 0);
                 }
                 Ev::Rooms(_) => {}
                 Ev::Typing { from } => {
                     self.typing_from = Some((from, Instant::now()));
                 }
-                Ev::Msg { from, text } => {
+                Ev::Msg { from, text, room } => {
                     if from == self.me {
                         continue;
                     }
                     let name = self.display_name(&from);
-                    let is_active = self.chats.iter().any(|c| c.id == from && {
-                        let idx = self.chats.iter().position(|c2| c2.id == from).unwrap_or(0);
-                        self.active == idx
-                    });
-                    if !is_active {
-                        toast_notify(&name, &text);
+                    match room {
+                        Some(r) if !r.is_empty() => {
+                            // Сообщение из комнаты — показываем в чате комнаты
+                            let id = room_chat_id(&r);
+                            let active = self.active < self.chats.len() && self.chats[self.active].id == id;
+                            if !active {
+                                toast_notify(&name, &text);
+                            }
+                            self.push_msg(&id, true, false, &name, &text, 0);
+                        }
+                        _ => {
+                            // Личное сообщение
+                            let is_active = self.chats.iter().any(|c| c.id == from && {
+                                let idx = self.chats.iter().position(|c2| c2.id == from).unwrap_or(0);
+                                self.active == idx
+                            });
+                            if !is_active {
+                                toast_notify(&name, &text);
+                            }
+                            self.push_msg(&from, false, false, &name, &text, 0);
+                        }
                     }
-                    self.push_msg(&from, false, false, &name, &text, 0);
                 }
-                Ev::FileMsg { from, name } => {
+                Ev::FileMsg { from, name, room } => {
                     let fname = self.display_name(&from);
-                    self.push_msg(&from, false, false, &fname, &format!("📎 файл «{}» сохранён в downloads/", name), 4);
+                    let text = format!("📎 файл «{}» сохранён в downloads/", name);
+                    match room {
+                        Some(r) if !r.is_empty() => {
+                            let id = room_chat_id(&r);
+                            let active = self.active < self.chats.len() && self.chats[self.active].id == id;
+                            if !active {
+                                toast_notify(&fname, &text);
+                            }
+                            self.push_msg(&id, true, false, &fname, &text, 4);
+                        }
+                        _ => {
+                            self.push_msg(&from, false, false, &fname, &text, 4);
+                        }
+                    }
+                }
+                Ev::Reaction { emoji, target_text, room } => {
+                    let target_lower: String = target_text.chars().take(80).collect();
+                    for chat in &mut self.chats {
+                        // Если реакция из комнаты — применяем только в чате этой комнаты
+                        if let Some(ref r) = room {
+                            if r.is_empty() || chat.id != room_chat_id(r) {
+                                continue;
+                            }
+                        }
+                        for msg in &mut chat.msgs {
+                            if msg.text.starts_with(&target_lower) || target_lower.starts_with(&msg.text.chars().take(80).collect::<String>().as_str()) {
+                                if let Some((_e, ref mut count)) = msg.reactions.iter_mut().find(|(e, _)| *e == emoji) {
+                                    *count += 1;
+                                } else {
+                                    msg.reactions.push((emoji.clone(), 1));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -586,10 +697,16 @@ impl MeshApp {
         }
         let chat = &self.chats[self.active];
         if chat.is_room {
+            let chat_id = chat.id.clone();
+            let room = room_name_of(&chat_id);
+            // Гарантируем, что сервер знает, в какой мы комнате
+            if self.current_room != room {
+                self.send_ui(UiCmd::Join { room: room.clone(), pass: "".into() });
+            }
             let text = msg.clone();
             let nick = self.my_nick.clone();
-            self.push_msg(ROOM_CHAT, true, true, &nick, &msg, 0);
-            self.send_ui(UiCmd::Room(text));
+            self.push_msg(&chat_id, true, true, &nick, &msg, 0);
+            self.send_ui(UiCmd::Room { room, text });
         } else {
             let target = chat.id.clone();
             let nick = self.my_nick.clone();
@@ -647,6 +764,7 @@ impl eframe::App for MeshApp {
             Screen::Chat => {
                 self.draw_sidebar(ctx);
                 self.draw_chat_view(ctx);
+                self.draw_reaction_menu(ctx);
                 self.draw_profile_window(ctx);
                 self.draw_create_room_window(ctx);
                 self.draw_join_room_window(ctx);
@@ -703,7 +821,7 @@ impl MeshApp {
                                 ui.add_space(14.0);
                                 ui.separator();
                                 ui.add_space(8.0);
-                                ui.label(egui::RichText::new("Быстрый вход").size(12.0).color(TEXT_DIM));
+                                ui.label(egui::RichText::new("Быстрый вход (пароли на диске — ✕ удаляет)").size(12.0).color(TEXT_DIM));
                                 ui.add_space(6.0);
                                 let saved = self.saved_accounts.clone();
                                 let mut remove_idx: Option<usize> = None;
@@ -742,6 +860,11 @@ impl MeshApp {
                     ui.label(
                         egui::RichText::new("Сервер видит только маршрутные имена — содержимое сообщений защищено E2E-шифрованием")
                             .size(11.5)
+                            .color(TEXT_DIM),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("MeshMessenger {}", APP_VERSION))
+                            .size(10.0)
                             .color(TEXT_DIM),
                     );
                 });
@@ -821,6 +944,13 @@ impl MeshApp {
                     .color(egui::Color32::from_rgb(250, 180, 100)),
             );
         }
+        ui.add_space(4.0);
+        ui.checkbox(&mut self.remember_me, egui::RichText::new("Запомнить пароль для быстрого входа").size(11.5).color(TEXT_DIM));
+        ui.label(
+            egui::RichText::new("⚠ пароль хранится на этом ПК — включайте только на личном устройстве")
+                .size(10.5)
+                .color(egui::Color32::from_rgb(250, 180, 100)),
+        );
     }
 
     fn draw_server_collapse(&mut self, ui: &mut egui::Ui) {
@@ -885,6 +1015,17 @@ impl MeshApp {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
+                        if ui.button("🚪").on_hover_text("Выйти из аккаунта").clicked() {
+                            if self.authed {
+                                self.send_ui(UiCmd::Raw("/exit".into()));
+                            }
+                            self.authed = false;
+                            self.connected = false;
+                            self.screen = Screen::Connect;
+                            self.ui_tx = None;
+                            self.ev_rx = None;
+                            self.password.clear();
+                        }
                         if ui.button("🔑").on_hover_text("TOFU-отпечатки ключей").clicked() {
                             self.show_fingerprints = !self.show_fingerprints;
                         }
@@ -1004,6 +1145,13 @@ impl MeshApp {
                 );
             }
             if let Some(i) = switch {
+                // Переключение на другую комнату — сервер должен переключить текущую комнату
+                if self.chats[i].is_room {
+                    let room = room_name_of(&self.chats[i].id);
+                    if self.current_room != room {
+                        self.send_ui(UiCmd::Join { room: room.clone(), pass: "".into() });
+                    }
+                }
                 self.active = i;
                 self.chats[i].unread = 0;
             }
@@ -1189,7 +1337,7 @@ impl MeshApp {
                                 let max_w = (ui.available_width() * 0.72).max(220.0);
                                 let msgs = self.chats[self.active].msgs.clone();
                                 let search_q = self.search_in_chat.to_lowercase();
-                                let mut prev_sender: Option<String> = None;
+                                let mut reaction_req: Option<ReactionMenu> = None;                                let mut prev_sender: Option<String> = None;
                                 let mut prev_mine = false;
                                 let mut prev_date = String::new();
                                 for (i, m) in msgs.iter().enumerate() {
@@ -1221,9 +1369,12 @@ impl MeshApp {
                                         .map(|nx| nx.sender != m.sender || nx.mine != m.mine || nx.date != m.date)
                                         .unwrap_or(true);
                                     ui.add_space(if same { 3.0 } else { 12.0 });
-                                    draw_bubble(ui, m, max_w, &self.me, first_of_group, last_of_group, i);
+                                    draw_bubble(ui, m, max_w, &self.me, first_of_group, last_of_group, i, &title, is_room, &self.ui_tx, &mut reaction_req);
                                     prev_sender = Some(m.sender.clone());
                                     prev_mine = m.mine;
+                                }
+                                if reaction_req.is_some() {
+                                    self.reaction_menu = reaction_req;
                                 }
                                 ui.add_space(10.0);
                             });
@@ -1240,9 +1391,20 @@ impl MeshApp {
             .frame(egui::Frame::default().fill(SIDEBAR).inner_margin(egui::Margin::symmetric(10.0, 8.0)))
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("📎").on_hover_text("Отправить файл в комнату").clicked() {
+                    let chat = &self.chats[self.active];
+                    let target = if is_room {
+                        room_name_of(&chat.id)
+                    } else {
+                        chat.id.clone()
+                    };
+                    let file_hint = if is_room { "Отправить файл в комнату" } else { "Отправить файл" };
+                    if ui.button("📎").on_hover_text(file_hint).clicked() {
                         if let Some(path) = pick_file() {
-                            self.send_ui(UiCmd::File(path.to_string_lossy().to_string()));
+                            self.send_ui(UiCmd::File {
+                                target: target.clone(),
+                                is_room,
+                                path: path.to_string_lossy().to_string(),
+                            });
                         }
                     }
                     let avail = (ui.available_width() - 130.0).max(150.0);
@@ -1575,7 +1737,7 @@ fn render_rich_text(ui: &mut egui::Ui, text: &str, base_color: egui::Color32) {
 }
 
 /// Пузырь сообщения в стиле Telegram: хвостик только у первого сообщения группы.
-fn draw_bubble(ui: &mut egui::Ui, m: &Msg, max_w: f32, me: &str, first_of_group: bool, _last_of_group: bool, _msg_idx: usize) {
+fn draw_bubble(ui: &mut egui::Ui, m: &Msg, max_w: f32, me: &str, first_of_group: bool, _last_of_group: bool, _msg_idx: usize, chat_id: &str, is_room: bool, _ui_tx: &Option<Sender<UiCmd>>, reaction_out: &mut Option<ReactionMenu>) {
     let _ = me;
     let is_me = m.mine;
     let (fill, align_right, text_color) = match m.kind {
@@ -1657,27 +1819,92 @@ fn draw_bubble(ui: &mut egui::Ui, m: &Msg, max_w: f32, me: &str, first_of_group:
                     });
                 });
             });
-        // Контекстное меню (правый клик)
+        // Контекстное меню (правый клик): только запоминаем позицию клика.
+        // Сам попап рисуется ОДИН раз в draw_reaction_menu — иначе панель висит
+        // у курсора постоянно и перехватывает все клики.
         let resp = ui.interact(ui.max_rect(), egui::Id::new(format!("bubble_{}", _msg_idx)), egui::Sense::click());
         if resp.secondary_clicked() {
-            ui.memory_mut(|mem| mem.open_popup(egui::Id::new("reaction_menu")));
+            if let Some(pos) = resp.interact_pointer_pos() {
+                *reaction_out = Some(ReactionMenu {
+                    chat_id: chat_id.to_string(),
+                    is_room,
+                    target_text: m.text.chars().take(80).collect(),
+                    pos,
+                    rect: None,
+                });
+            }
         }
     });
-    // Popup меню реакций
-    egui::Area::new(egui::Id::new("reaction_menu"))
-        .fixed_pos(ui.input(|i| i.pointer.interact_pos().unwrap_or(egui::pos2(0.0, 0.0))))
-        .show(ui.ctx(), |ui| {
-            egui::Frame::default().fill(SIDEBAR).rounding(8.0).inner_margin(egui::Margin::same(6.0)).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for emoji in &["👍", "❤️", "😂", "😮", "😢", "🔥"] {
-                        if ui.add(egui::Button::new(egui::RichText::new(*emoji).size(18.0)).fill(egui::Color32::TRANSPARENT)).clicked() {
-                            // TODO: отправить реакцию через сеть
-                            ui.memory_mut(|mem| mem.close_popup());
+}
+
+impl MeshApp {
+/// Меню реакций: рисуется ТОЛЬКО когда открыто ПКМ, в точке клика.
+/// Закрытие: выбор emoji, Esc, клик мимо.
+fn draw_reaction_menu(&mut self, ctx: &egui::Context) {
+    let (chat_id, is_room, target_text, pos, rect) = match &self.reaction_menu {
+        Some(m) => (m.chat_id.clone(), m.is_room, m.target_text.clone(), m.pos, m.rect),
+        None => return,
+    };
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        self.reaction_menu = None;
+        return;
+    }
+    if let Some(r) = rect {
+        let clicked_outside = ctx.input(|i| i.pointer.primary_clicked())
+            && ctx.input(|i| i.pointer.interact_pos().map(|p| !r.contains(p)).unwrap_or(true));
+        if clicked_outside {
+            self.reaction_menu = None;
+            return;
+        }
+    }
+    // не даём уехать за край окна (примерный размер панели 260×48)
+    let vp = ctx.input(|i| i.screen_rect());
+    let pos = egui::pos2(
+        pos.x.min(vp.max.x - 260.0).max(vp.min.x + 4.0),
+        pos.y.min(vp.max.y - 60.0).max(vp.min.y + 4.0),
+    );
+    let resp = egui::Area::new(egui::Id::new("reaction_menu"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            egui::Frame::default()
+                .fill(SIDEBAR)
+                .rounding(8.0)
+                .inner_margin(egui::Margin::same(6.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for emoji in &["👍", "❤️", "😂", "😮", "😢", "🔥"] {
+                            if ui
+                                .add(
+                                    egui::Button::new(egui::RichText::new(*emoji).size(18.0))
+                                        .fill(egui::Color32::TRANSPARENT),
+                                )
+                                .clicked()
+                            {
+                                // Для комнат — чистое имя комнаты (без "# "), как маркер получателю
+                                let target_chat = if is_room {
+                                    room_name_of(&chat_id)
+                                } else {
+                                    chat_id.clone()
+                                };
+                                self.send_ui(UiCmd::Reaction {
+                                    target_chat,
+                                    is_room,
+                                    emoji: emoji.to_string(),
+                                    target_text: target_text.clone(),
+                                });
+                                // Реакция обновится через Ev::Reaction (локальное эхо из net-потока)
+                                self.reaction_menu = None;
+                                break;
+                            }
                         }
-                    }
+                    });
                 });
-            });
         });
+    if let Some(m) = self.reaction_menu.as_mut() {
+        m.rect = Some(resp.response.rect);
+    }
+}
 }
 
 fn pick_file() -> Option<PathBuf> {
@@ -1706,10 +1933,33 @@ fn pick_file() -> Option<PathBuf> {
 struct AppWithTray {
     app: MeshApp,
     _tray_icon: Option<tray_icon::TrayIcon>,
+    show_id: muda::MenuId,
+    quit_id: muda::MenuId,
 }
 
 impl eframe::App for AppWithTray {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Сворачивание в трей при закрытии окна
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        // Обработка пунктов меню трея
+        while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+            if event.id == self.show_id {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            } else if event.id == self.quit_id {
+                std::process::exit(0);
+            }
+        }
+        // Обработка двойного клика по иконке трея
+        while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
+            if let tray_icon::TrayIconEvent::DoubleClick { .. } = event {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
         self.app.update(ctx, frame);
     }
 }
@@ -1719,7 +1969,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([800.0, 560.0])
-            .with_title("MeshMessenger"),
+            .with_title(format!("MeshMessenger {}", APP_VERSION)),
         ..Default::default()
     };
     eframe::run_native(
@@ -1728,17 +1978,50 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             apply_custom_theme(&cc.egui_ctx);
 
-            // Трей — пытаемся загрузить иконку, если нет файла — просто без иконки
+            // Трей: icon.ico рядом с exe, иначе — сгенерированная иконка
+            // (раньше без файла трея вообще не было).
+            fn fallback_icon() -> Option<tray_icon::Icon> {
+                const W: u32 = 32;
+                let mut rgba = vec![0u8; (W * W * 4) as usize];
+                for y in 0..W {
+                    for x in 0..W {
+                        let i = ((y * W + x) * 4) as usize;
+                        let border = x < 3 || y < 3 || x >= W - 3 || y >= W - 3;
+                        let (r, g, b) = if border { (80, 162, 233) } else { (43, 82, 120) };
+                        rgba[i] = r;
+                        rgba[i + 1] = g;
+                        rgba[i + 2] = b;
+                        rgba[i + 3] = 255;
+                    }
+                }
+                // белая «галочка»-точка по центру
+                for (dx, dy) in [(-4i32, 0), (-1, -3), (-1, 3), (2, 6), (2, -6), (5, -9), (5, 9)] {
+                    let (cx, cy) = (16 + dx, 16 + dy);
+                    if cx >= 0 && cy >= 0 && cx < 32 && cy < 32 {
+                        let i = ((cy as u32 * W + cx as u32) * 4) as usize;
+                        rgba[i] = 255;
+                        rgba[i + 1] = 255;
+                        rgba[i + 2] = 255;
+                    }
+                }
+                tray_icon::Icon::from_rgba(rgba, W, W).ok()
+            }
             let icon_path = std::env::current_dir().ok().map(|p| p.join("icon.ico"));
-            let tray_icon = icon_path
+            let icon = icon_path
                 .filter(|p| p.exists())
                 .and_then(|p| tray_icon::Icon::from_path(p, None).ok())
+                .or_else(fallback_icon);
+            let mut show_id = muda::MenuId::default();
+            let mut quit_id = muda::MenuId::default();
+            let tray_icon = icon
                 .and_then(|icon| {
                     let menu = muda::Menu::new();
-                    let _show = muda::MenuItem::new("Показать", true, None);
-                    let _quit = muda::MenuItem::new("Выход", true, None);
-                    menu.append(&_show).ok()?;
-                    menu.append(&_quit).ok()?;
+                    let item_show = muda::MenuItem::new("Показать", true, None);
+                    let item_quit = muda::MenuItem::new("Выход", true, None);
+                    show_id = item_show.id().clone();
+                    quit_id = item_quit.id().clone();
+                    menu.append(&item_show).ok()?;
+                    menu.append(&item_quit).ok()?;
                     tray_icon::TrayIconBuilder::new()
                         .with_menu(Box::new(menu))
                         .with_tooltip("MeshMessenger — E2E мессенджер")
@@ -1747,7 +2030,12 @@ fn main() -> eframe::Result<()> {
                         .ok()
                 });
 
-            Ok(Box::new(AppWithTray { app: MeshApp::default(), _tray_icon: tray_icon }))
+            Ok(Box::new(AppWithTray {
+                app: MeshApp::default(),
+                _tray_icon: tray_icon,
+                show_id,
+                quit_id,
+            }))
         }),
     )
 }
@@ -1763,6 +2051,11 @@ fn apply_custom_theme(ctx: &egui::Context) {
         );
         if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
             prop.insert(0, "segoe_ui".into());
+            // Emoji-fallback: без него эмодзи рисуются квадратами □
+            if let Ok(emoji) = std::fs::read("C:\\Windows\\Fonts\\seguiemj.ttf") {
+                fonts.font_data.insert("emoji".into(), egui::FontData::from_owned(emoji).into());
+                prop.push("emoji".into());
+            }
         }
         if let Ok(bold) = std::fs::read("C:\\Windows\\Fonts\\segoeuib.ttf") {
             fonts.font_data.insert("segoe_ui_bold".into(), egui::FontData::from_owned(bold).into());
