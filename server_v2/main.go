@@ -528,8 +528,8 @@ func handleClient(conn net.Conn, address string) {
 				sendToUsername(typeMessage, payload, conn, target)
 				continue
 			}
+			// Слепой режим: сервер релеит и забывает — история на сервере не хранится.
 			logMessage(username, "(E2E сообщение в "+room+")")
-			dbSaveMessage(username, room, string(payload), "text")
 			broadcastToRoom(typeMessage, payload, conn, room)
 			fmt.Printf("[%s]: (E2E сообщение → комната %s)\n", username, room)
 		} else if frameType == typeFile {
@@ -540,7 +540,6 @@ func handleClient(conn net.Conn, address string) {
 				sendToUsername(typeFile, payload, conn, target)
 			} else {
 				logMessage(username, "(file)")
-				dbSaveMessage(username, room, string(payload), "file")
 				broadcastToRoom(typeFile, payload, conn, room)
 			}
 			fmt.Printf("[%s]: (файл → %s)\n", username, room)
@@ -1017,26 +1016,8 @@ func handleCommand(command string, self *Client) {
 		sendFrameString(conn, typeCommand, encryptMessage("\n[О ПРОЕКТЕ] MeshMessenger v2\nЗащищённый мессенджер с E2E-шифрованием (X25519 + AES-256-GCM).\nАккаунты: @username + nick + bio + приватность статуса."))
 
 	case strings.HasPrefix(command, "/history"):
-		fields := strings.Fields(command)
-		historyRoom := self.room
-		historyLimit := 50
-		if len(fields) >= 2 {
-			historyRoom = fields[1]
-		}
-		if len(fields) >= 3 {
-			fmt.Sscanf(fields[2], "%d", &historyLimit)
-		}
-		msgs := dbLoadHistory(historyRoom, historyLimit)
-		if len(msgs) == 0 {
-			sendFrameString(conn, typeCommand, encryptMessage("[ИСТОРИЯ] Нет сообщений в комнате "+historyRoom))
-		} else {
-			var lines []string
-			lines = append(lines, fmt.Sprintf("[ИСТОРИЯ] Комната %s (%d сообщений):", historyRoom, len(msgs)))
-			for _, m := range msgs {
-				lines = append(lines, fmt.Sprintf("  [%s] %s: (E2E сообщение)", m["time"], m["sender"]))
-			}
-			sendFrameString(conn, typeCommand, encryptMessage(strings.Join(lines, "\n")))
-		}
+		// Слепой режим: сервер не хранит сообщения, история живёт только на клиентах.
+		sendFrameString(conn, typeCommand, encryptMessage("[ИСТОРИЯ] Сервер работает в слепом режиме — история сообщений не хранится"))
 
 	case command == "/serverstats":
 		stats := dbGetStats()
