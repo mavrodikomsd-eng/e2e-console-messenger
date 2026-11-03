@@ -681,6 +681,7 @@ func handleCommand(command string, self *Client) {
 		u, pwd := self.username, fields[1]
 		if len(fields) >= 3 {
 			u = strings.ToLower(fields[1])
+			pwd = fields[2]
 		}
 		clientsMutex.Lock()
 		acc, ok := accounts[u]
