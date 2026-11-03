@@ -149,6 +149,21 @@ fn paint_aurora(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     }
 }
 
+/// Системный «дзынь» нового сообщения (без внешних зависимостей).
+#[cfg(windows)]
+fn message_beep() {
+    // MB_ICONASTERISK = 0x40
+    unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(0x40);
+    }
+}
+
+#[cfg(not(windows))]
+fn message_beep() {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(b"\x07");
+}
+
 const APP_VERSION: &str = "v1.6.1";
 
 const SYS_CHAT: &str = "\u{1f4e1} Сервер";
@@ -358,6 +373,9 @@ struct MeshApp {
     users: Vec<User>,
     typing_from: Option<(String, Instant)>,
     last_typing_sent: Option<Instant>,
+    // ── Оповещения ──
+    window_focused: bool,
+    last_title: String,
     // ── Окна ──
     show_fingerprints: bool,
     show_profile: bool,
@@ -443,6 +461,8 @@ impl Default for MeshApp {
             saved_accounts: load_accounts(),
             remember_me: false,
             reaction_menu: None,
+            window_focused: true,
+            last_title: format!("MeshMessenger {}", APP_VERSION),
         };
         app
     }
@@ -465,6 +485,11 @@ impl MeshApp {
         chat.last_activity = std::time::Instant::now();
         if !active {
             chat.unread += 1;
+            // Новое чужое сообщение, когда окно не в фокусе: системный звук.
+            // Свои сообщения и системные уведомления беззвучны.
+            if !mine && kind == 0 && !self.window_focused {
+                message_beep();
+            }
         }
         if chat.msgs.len() > 3000 {
             chat.msgs.drain(..1000);
@@ -817,6 +842,7 @@ impl MeshApp {
 impl eframe::App for MeshApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
+        self.window_focused = ctx.input(|i| i.viewport().focused != Some(false));
         ctx.request_repaint_after(Duration::from_millis(80));
 
         match self.screen {
@@ -831,6 +857,18 @@ impl eframe::App for MeshApp {
                 self.draw_whois_window(ctx);
                 self.draw_fingerprints(ctx);
             }
+        }
+
+        // Счётчик непрочитанных в заголовке окна: «(2) MeshMessenger…»
+        let total_unread: usize = self.chats.iter().map(|c| c.unread).sum();
+        let title = if total_unread > 0 {
+            format!("({}) MeshMessenger {}", total_unread, APP_VERSION)
+        } else {
+            format!("MeshMessenger {}", APP_VERSION)
+        };
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
         }
     }
 }

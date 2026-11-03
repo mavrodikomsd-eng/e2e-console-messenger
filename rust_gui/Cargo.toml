@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 eframe = "0.29"
+windows-sys = { version = "0.59", features = ["Win32_System_Diagnostics_Debug", "Win32_Foundation"] }
 aes-gcm = "0.10"
 x25519-dalek = "1"
 sha2 = "0.10"
