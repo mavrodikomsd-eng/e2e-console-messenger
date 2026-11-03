@@ -80,6 +80,13 @@ class UsernameValidationTests(unittest.TestCase):
         self.assertFalse(valid_username("a\x00b"))
         self.assertFalse(valid_username("a\nb"))
 
+    def test_command_line_is_not_a_username(self):
+        # Регрессия: первая строка пайпа («/register ник пароль пароль»)
+        # раньше проходила валидацию и становилась именем пользователя.
+        self.assertFalse(valid_username("/register ztest2 testpass123 testpass123"))
+        self.assertFalse(valid_username("/login nick pass"))
+        self.assertFalse(valid_username("user name"))
+
 
 class Argon2Tests(unittest.TestCase):
     def test_verify_correct_and_wrong(self):

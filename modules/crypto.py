@@ -17,8 +17,12 @@ try:
 except Exception:
     _LM_DLL = False
 
-KEY_FILE = "secret.key"
-CONFIG_FILE = "config.json"
+# Пути привязаны к корню проекта (родитель modules/), а не к текущему
+# каталогу: иначе запуск клиента из другой папки создавал бы НОВЫЙ
+# secret.key в cwd, и клиент молча переставал понимать сервер.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+KEY_FILE = os.path.join(PROJECT_ROOT, "secret.key")
+CONFIG_FILE = os.path.join(PROJECT_ROOT, "config.json")
 
 # ─────────────────────────────────────────────
 #  AES-256-GCM
