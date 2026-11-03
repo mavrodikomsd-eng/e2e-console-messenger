@@ -62,21 +62,92 @@ fn save_account(acc: &SavedAccount) {
     save_accounts(&accounts);
 }
 
-// ── Палитра Telegram Desktop (тёмная) ───────────────────
-const CHAT_BG: egui::Color32 = egui::Color32::from_rgb(14, 22, 33); // #0e1621 — фон ленты
-const SIDEBAR: egui::Color32 = egui::Color32::from_rgb(23, 33, 43); // #17212b — сайдбар/шапки
-const PANEL_2: egui::Color32 = egui::Color32::from_rgb(32, 43, 54); // #202b36 — hover/вторичное
-const INPUT_BG: egui::Color32 = egui::Color32::from_rgb(36, 47, 61); // #242f3d — поля ввода
-const INPUT_STROKE: egui::Color32 = egui::Color32::from_rgb(52, 66, 82);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(80, 162, 233); // #50a2e9
-const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(106, 179, 243);
-const BUBBLE_ME: egui::Color32 = egui::Color32::from_rgb(43, 82, 120); // #2b5278
-const BUBBLE_OTHER: egui::Color32 = egui::Color32::from_rgb(24, 37, 51); // #182533
-const TEXT: egui::Color32 = egui::Color32::from_rgb(233, 239, 245);
-const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(112, 132, 153); // #708499
-const DIVIDER: egui::Color32 = egui::Color32::from_rgb(16, 25, 33);
-const ONLINE: egui::Color32 = egui::Color32::from_rgb(77, 205, 94); // #4dcd5e
-const TIME_IN_BUBBLE: egui::Color32 = egui::Color32::from_rgb(160, 180, 200);
+// ── Палитра «Mesh Aurora»: глубокий индиго + фиолетово-циановое сияние ──
+const CHAT_BG: egui::Color32 = egui::Color32::from_rgb(10, 12, 24); // #0a0c18 — фон ленты
+const SIDEBAR: egui::Color32 = egui::Color32::from_rgb(16, 19, 36); // #101324 — сайдбар/карточки
+const PANEL_2: egui::Color32 = egui::Color32::from_rgb(24, 28, 50); // #181c32 — hover/вторичное
+const INPUT_BG: egui::Color32 = egui::Color32::from_rgb(26, 30, 54); // #1a1e36 — поля ввода
+const INPUT_STROKE: egui::Color32 = egui::Color32::from_rgb(72, 82, 140);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 92, 255); // #7c5cff — фиолет
+const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(148, 120, 255);
+const ACCENT_2: egui::Color32 = egui::Color32::from_rgb(56, 214, 220); // #38d6dc — циан
+const BUBBLE_ME: egui::Color32 = egui::Color32::from_rgb(58, 44, 118); // фиолетовый пузырь
+const BUBBLE_OTHER: egui::Color32 = egui::Color32::from_rgb(22, 26, 46);
+const TEXT: egui::Color32 = egui::Color32::from_rgb(236, 240, 252);
+const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(124, 134, 172);
+const DIVIDER: egui::Color32 = egui::Color32::from_rgb(12, 14, 26);
+const ONLINE: egui::Color32 = egui::Color32::from_rgb(64, 220, 160); // #40dca0 — мята
+const TIME_IN_BUBBLE: egui::Color32 = egui::Color32::from_rgb(150, 160, 205);
+const BG_TOP: egui::Color32 = egui::Color32::from_rgb(44, 30, 92); // верх градиента экрана входа
+const HEADER_TOP: egui::Color32 = egui::Color32::from_rgb(20, 24, 46); // верх градиента шапки чата
+
+/// Вертикальный градиент прямоугольника (две вершины-полосы через Mesh).
+fn paint_gradient(painter: &egui::Painter, rect: egui::Rect, top: egui::Color32, bottom: egui::Color32) {
+    let mut mesh = egui::Mesh::default();
+    let i0 = mesh.vertices.len() as u32;
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.add_triangle(i0, i0 + 1, i0 + 2);
+    mesh.add_triangle(i0, i0 + 2, i0 + 3);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Мягкая тень для карточек и пузырей.
+fn soft_shadow(alpha: u8, blur: f32, dy: f32) -> egui::epaint::Shadow {
+    egui::epaint::Shadow {
+        offset: egui::vec2(0.0, dy),
+        blur,
+        spread: 0.0,
+        color: egui::Color32::from_black_alpha(alpha),
+    }
+}
+
+/// Smoothstep: плавный S-образный переход 0→1.
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Линейная интерполяция цвета (для проявления пузырей и карточек).
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    egui::Color32::from_rgb(
+        a.r() + ((b.r() as f32 - a.r() as f32) * t) as u8,
+        a.g() + ((b.g() as f32 - a.g() as f32) * t) as u8,
+        a.b() + ((b.b() as f32 - a.b() as f32) * t) as u8,
+    )
+}
+
+/// Живое «сияние» для экрана входа: базовый градиент + три дрейфующих
+/// светящихся пятна (фиолет/циан), которые медленно плавают по экрану.
+fn paint_aurora(painter: &egui::Painter, rect: egui::Rect, time: f64) {
+    paint_gradient(painter, rect, BG_TOP, CHAT_BG);
+    let t = time as f32;
+    let blobs: [(f32, f32, f32, egui::Color32); 3] = [
+        (0.28, 0.22, 0.62, ACCENT),
+        (0.78, 0.38, 0.50, ACCENT_2),
+        (0.50, 0.92, 0.70, egui::Color32::from_rgb(70, 46, 140)),
+    ];
+    for (i, (cx, cy, r, col)) in blobs.iter().enumerate() {
+        let ph = t * 0.35 + i as f32 * 2.1;
+        let x = rect.left() + rect.width() * (cx + 0.07 * ph.sin());
+        let y = rect.top() + rect.height() * (cy + 0.05 * (ph * 1.3).cos());
+        let rad = rect.height() * r * (1.0 + 0.08 * (ph * 0.7).sin());
+        // Радиальный спад: концентрические круги от большого тусклого к малому яркому
+        let steps = 10;
+        for s in (0..steps).rev() {
+            let k = s as f32 / steps as f32; // 1.0 → внешний, 0.0 → центр
+            let alpha = (34.0 * (1.0 - k) * (1.0 - k)) as u8;
+            painter.circle_filled(
+                egui::pos2(x, y),
+                rad * (0.30 + 0.70 * k),
+                egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha),
+            );
+        }
+    }
+}
 
 const APP_VERSION: &str = "v1.6.1";
 
@@ -373,17 +444,6 @@ impl Default for MeshApp {
             remember_me: false,
             reaction_menu: None,
         };
-        // Демо-сообщения, чтобы видеть вёрстку пузырей до подключения.
-        let t = now_hhmm();
-        for (mine, sender, text) in [
-            (false, "Алиса", "Привет! 👋 Это тестовое сообщение — проверяем вёрстку пузырей."),
-            (true, "Я", "Привет, Алиса! Выглядит отлично, как в Telegram 🙂"),
-            (false, "Боб", "И у меня всё читается. Шифрование E2E работает 🔒"),
-        ] {
-            if let Some(room) = app.chats.first_mut() {
-                room.msgs.push(Msg { mine, sender: sender.to_string(), text: text.to_string(), kind: 0, time: t.clone(), date: now_date(), reactions: vec![], read: true });
-            }
-        }
         app
     }
 }
@@ -777,25 +837,66 @@ impl eframe::App for MeshApp {
 
 impl MeshApp {
     fn draw_connect(&mut self, ctx: &egui::Context) {
+        // Живой фон требует постоянной перерисовки (дрейф сияния + пульс логотипа).
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        let time = ctx.input(|i| i.time);
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(CHAT_BG).inner_margin(egui::Margin::same(32.0)))
             .show(ctx, |ui| {
+                paint_aurora(ui.painter(), ui.max_rect(), time);
                 ui.vertical_centered(|ui| {
-                    ui.add_space(24.0);
-                    ui.heading(egui::RichText::new("🛡 MeshMessenger").size(30.0).color(TEXT));
-                    ui.add_space(4.0);
+                    ui.add_space(18.0);
+                    // Логотип: круг с акцентным градиентом и щитом, мягкая пульсация ореола
+                    let (logo, _) = ui.allocate_exact_size(egui::vec2(76.0, 76.0), egui::Sense::hover());
+                    let pulse = 0.5 + 0.5 * (time * 1.7).sin() as f32;
+                    ui.painter().circle_filled(
+                        logo.center(),
+                        38.0 + 5.0 * pulse,
+                        ACCENT.gamma_multiply(0.25 + 0.15 * pulse),
+                    );
+                    ui.painter().circle_filled(logo.center(), 30.0, ACCENT);
+                    ui.painter().circle_filled(
+                        logo.center(),
+                        30.0,
+                        egui::Color32::from_rgba_unmultiplied(ACCENT_2.r(), ACCENT_2.g(), ACCENT_2.b(), (40.0 * pulse) as u8),
+                    );
+                    ui.painter().text(
+                        logo.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "🛡",
+                        egui::FontId::proportional(30.0),
+                        egui::Color32::WHITE,
+                    );
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("MeshMessenger").size(30.0).strong().color(TEXT));
+                    ui.add_space(2.0);
                     ui.label(
                         egui::RichText::new("X25519 · AES-256-GCM · Argon2id · TOFU")
                             .size(12.5)
                             .color(TEXT_DIM),
                     );
-                    ui.add_space(28.0);
+                    ui.add_space(24.0);
                 });
                 ui.vertical_centered(|ui| {
+                    // Карточка входа плавно всплывает при появлении экрана
+                    let card_id = egui::Id::new("login_card_in");
+                    let now = ui.input(|i| i.time);
+                    let born = ui.ctx().data_mut(|d| -> f64 {
+                        if let Some(b) = d.get_temp(card_id) {
+                            b
+                        } else {
+                            d.insert_temp(card_id, now);
+                            now
+                        }
+                    });
+                    let card_t = smoothstep(((now - born) / 0.45).clamp(0.0, 1.0) as f32);
+                    ui.add_space((1.0 - card_t) * 26.0);
                     egui::Frame::default()
-                        .fill(SIDEBAR)
-                        .rounding(14.0)
-                        .inner_margin(egui::Margin::same(24.0))
+                        .fill(lerp_color(CHAT_BG, SIDEBAR, card_t))
+                        .rounding(18.0)
+                        .stroke(egui::Stroke::new(1.0_f32, INPUT_STROKE.gamma_multiply(card_t)))
+                        .shadow(soft_shadow((140.0 * card_t) as u8, 36.0, 10.0))
+                        .inner_margin(egui::Margin::same(26.0))
                         .show(ui, |ui| {
                             ui.set_min_width(420.0);
                             self.draw_auth_toggle(ui);
@@ -829,15 +930,24 @@ impl MeshApp {
                                 for (i, acc) in saved.iter().enumerate() {
                                     ui.horizontal(|ui| {
                                         ui.add_space(8.0);
-                                        ui.label(egui::RichText::new(&acc.username).size(13.0).color(TEXT));
+                                        // Кликабельна только строка с ником — раньше
+                                        // interact-зона накрывала ✕, и клик по строке
+                                        // случайно удалял аккаунт.
+                                        let row = ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&acc.username).size(13.0).color(TEXT),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        );
+                                        if row.clicked() {
+                                            clicked_idx = Some(i);
+                                        }
+                                        if row.hovered() {
+                                            row.on_hover_text("Войти под этим аккаунтом");
+                                        }
                                         ui.label(egui::RichText::new(format!("({}:{})", acc.host, acc.port)).size(10.5).color(TEXT_DIM));
                                         if ui.small_button("✕").on_hover_text("Удалить").clicked() {
                                             remove_idx = Some(i);
-                                        } else {
-                                            let row_resp = ui.interact(ui.available_rect_before_wrap(), egui::Id::new(format!("saved_{}", i)), egui::Sense::click());
-                                            if row_resp.clicked() {
-                                                clicked_idx = Some(i);
-                                            }
                                         }
                                     });
                                 }
@@ -1173,7 +1283,11 @@ impl MeshApp {
             egui::Color32::TRANSPARENT
         };
         let pill = rect.shrink2(egui::vec2(6.0, 1.0));
-        ui.painter().rect_filled(pill, 8.0, fill);
+        ui.painter().rect_filled(pill, 12.0, fill);
+        if selected {
+            let bar = egui::Rect::from_min_size(pill.left_top() + egui::vec2(0.0, 14.0), egui::vec2(3.0, pill.height() - 28.0));
+            ui.painter().rect_filled(bar, 2.0, ACCENT);
+        }
         let av = egui::Rect::from_min_size(rect.left_top() + egui::vec2(10.0, 10.0), egui::vec2(36.0, 36.0));
         ui.painter().circle_filled(av.center(), 18.0, avatar_color(&chat.id));
         ui.painter().text(
@@ -1223,7 +1337,11 @@ impl MeshApp {
             egui::Color32::TRANSPARENT
         };
         let pill = rect.shrink2(egui::vec2(6.0, 1.0));
-        ui.painter().rect_filled(pill, 8.0, fill);
+        ui.painter().rect_filled(pill, 12.0, fill);
+        if selected {
+            let bar = egui::Rect::from_min_size(pill.left_top() + egui::vec2(0.0, 14.0), egui::vec2(3.0, pill.height() - 28.0));
+            ui.painter().rect_filled(bar, 2.0, ACCENT);
+        }
         let av = egui::Rect::from_min_size(rect.left_top() + egui::vec2(10.0, 10.0), egui::vec2(36.0, 36.0));
         ui.painter().circle_filled(av.center(), 18.0, avatar_color(at));
         ui.painter().text(
@@ -1270,8 +1388,9 @@ impl MeshApp {
                 egui::TopBottomPanel::top("chat_header")
                     .frame(egui::Frame::default().fill(SIDEBAR).inner_margin(egui::Margin::symmetric(12.0, 8.0)))
                     .show_inside(ui, |ui| {
+                        paint_gradient(ui.painter(), ui.max_rect(), HEADER_TOP, SIDEBAR);
                         ui.horizontal(|ui| {
-                            Self::avatar(ui, &title, 34.0);
+                            Self::avatar(ui, &title, 36.0);
                             ui.vertical(|ui| {
                                 let display = if is_room { title.clone() } else { self.display_name(&title) };
                                 ui.label(egui::RichText::new(display).size(16.0).color(TEXT));
@@ -1407,18 +1526,29 @@ impl MeshApp {
                             });
                         }
                     }
-                    let avail = (ui.available_width() - 130.0).max(150.0);
+                    let avail = (ui.available_width() - 150.0).max(150.0);
                     let hint = if is_room { "Сообщение в комнату…" } else { "Личное сообщение…" };
                     let before = self.input.clone();
-                    let resp = ui.add_sized(
-                        [avail, 22.0],
-                        egui::TextEdit::singleline(&mut self.input).hint_text(hint),
-                    );
+                    let mut resp_slot = None;
+                    egui::Frame::default()
+                        .fill(INPUT_BG)
+                        .rounding(22.0)
+                        .inner_margin(egui::Margin::symmetric(14.0, 7.0))
+                        .show(ui, |ui| {
+                            resp_slot = Some(ui.add(
+                                egui::TextEdit::singleline(&mut self.input)
+                                    .hint_text(hint)
+                                    .frame(false)
+                                    .desired_width(avail - 28.0),
+                            ));
+                        });
+                    let resp = resp_slot.expect("input field");
                     self.maybe_send_typing(self.input != before);
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let send_btn = egui::Button::new(egui::RichText::new("Отправить").color(egui::Color32::WHITE))
+                    let send_btn = egui::Button::new(egui::RichText::new("Отправить").color(egui::Color32::WHITE).strong())
                         .fill(ACCENT)
-                        .rounding(18.0);
+                        .rounding(20.0)
+                        .min_size(egui::vec2(110.0, 36.0));
                     let send = ui.add_enabled(self.connected, send_btn).clicked();
                     if send || enter {
                         self.submit_input();
@@ -1741,13 +1871,29 @@ fn draw_bubble(ui: &mut egui::Ui, m: &Msg, max_w: f32, me: &str, first_of_group:
     let _ = me;
     let is_me = m.mine;
     let (fill, align_right, text_color) = match m.kind {
-        2 => (egui::Color32::from_rgb(80, 45, 45), false, egui::Color32::from_rgb(255, 150, 150)),
-        3 => (egui::Color32::from_rgb(80, 68, 32), false, egui::Color32::from_rgb(250, 220, 130)),
+        2 => (egui::Color32::from_rgb(86, 36, 52), false, egui::Color32::from_rgb(255, 150, 150)),
+        3 => (egui::Color32::from_rgb(86, 70, 30), false, egui::Color32::from_rgb(250, 220, 130)),
         _ if is_me => (BUBBLE_ME, true, TEXT),
         _ => (BUBBLE_OTHER, false, TEXT),
     };
+    // Плавное появление пузыря: сдвиг снизу + проявление (0.28с, smoothstep)
+    let anim_key = egui::Id::new(("mesh_bubble", chat_id, m.time.clone(), m.sender.clone(), m.text.len()));
+    let now = ui.input(|i| i.time);
+    let born = ui.ctx().data_mut(|d| -> f64 {
+        if let Some(b) = d.get_temp(anim_key) {
+            b
+        } else {
+            d.insert_temp(anim_key, now);
+            now
+        }
+    });
+    let t = smoothstep(((now - born) / 0.28).clamp(0.0, 1.0) as f32);
+    if t < 1.0 {
+        ui.ctx().request_repaint();
+    }
+    let fill = lerp_color(CHAT_BG, fill, t);
     // Скругление: у первого в группе «хвост» (острый угол), у остальных — ровно
-    let r = 12.0;
+    let r = 14.0;
     let tail = if first_of_group { 3.0 } else { r };
     let rounding = if align_right {
         egui::Rounding { nw: r, ne: r, sw: r, se: tail }
@@ -1755,18 +1901,21 @@ fn draw_bubble(ui: &mut egui::Ui, m: &Msg, max_w: f32, me: &str, first_of_group:
         egui::Rounding { nw: r, ne: r, sw: tail, se: r }
     };
 
-    ui.horizontal(|ui| {
-        if align_right {
-            let w = ui.available_width();
-            if w > max_w + 40.0 {
-                ui.allocate_space(egui::vec2(w - max_w - 40.0, 0.0));
+    ui.vertical(|ui| {
+        ui.add_space((1.0 - t) * 8.0);
+        ui.horizontal(|ui| {
+            if align_right {
+                let w = ui.available_width();
+                if w > max_w + 40.0 {
+                    ui.allocate_space(egui::vec2(w - max_w - 40.0, 0.0));
+                }
+            } else {
+                ui.add_space(6.0);
             }
-        } else {
-            ui.add_space(6.0);
-        }
-        egui::Frame::default()
-            .fill(fill)
-            .rounding(rounding)
+            egui::Frame::default()
+                .fill(fill)
+                .rounding(rounding)
+                .shadow(soft_shadow((70.0 * t) as u8, 10.0, 2.0))
             .inner_margin(egui::Margin::symmetric(12.0, 7.0))
             .show(ui, |ui| {
                 ui.set_max_width(max_w);
@@ -1817,8 +1966,9 @@ fn draw_bubble(ui: &mut egui::Ui, m: &Msg, max_w: f32, me: &str, first_of_group:
                             },
                         ));
                     });
-                });
+                    });
             });
+        });
         // Контекстное меню (правый клик): только запоминаем позицию клика.
         // Сам попап рисуется ОДИН раз в draw_reaction_menu — иначе панель висит
         // у курсора постоянно и перехватывает все клики.
@@ -2089,7 +2239,7 @@ fn apply_custom_theme(ctx: &egui::Context) {
     v.widgets.inactive.weak_bg_fill = INPUT_BG;
     v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, INPUT_STROKE);
     v.widgets.inactive.fg_stroke = egui::Stroke::new(1.2_f32, TEXT);
-    v.widgets.inactive.rounding = egui::Rounding::same(8.0);
+    v.widgets.inactive.rounding = egui::Rounding::same(10.0);
 
     v.widgets.hovered.bg_fill = PANEL_2;
     v.widgets.hovered.weak_bg_fill = PANEL_2;
@@ -2113,6 +2263,12 @@ fn apply_custom_theme(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(14.0, 8.0);
     style.spacing.menu_margin = egui::Margin::same(8.0);
     style.spacing.indent = 18.0;
+
+    // Тонкий плавающий скроллбар, как в современных мессенджерах
+    style.spacing.scroll = egui::style::ScrollStyle::floating();
+    style.spacing.scroll.bar_width = 6.0;
+    style.spacing.scroll.floating_width = 4.0;
+    style.spacing.scroll.handle_min_length = 24.0;
 
     ctx.set_style(style);
 }
