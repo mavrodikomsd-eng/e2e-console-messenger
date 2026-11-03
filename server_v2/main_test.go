@@ -331,6 +331,63 @@ func TestPrivateMessageRelay(t *testing.T) {
 	}
 }
 
+// Слепой режим: сообщение уходит в комнату, но НЕ пишется в SQLite.
+// Регрессия на коммит 70c3304 — если кто-то вернёт dbSaveMessage,
+// тест это поймает.
+func TestBlindModeNoHistoryStored(t *testing.T) {
+	const userA = "@testblind_a"
+	const userB = "@testblind_b"
+	cleanupTestAccount(t, userA)
+	cleanupTestAccount(t, userB)
+
+	a := authClient(t, userA)
+	defer a.Close()
+	time.Sleep(100 * time.Millisecond)
+	b := authClient(t, userB)
+	defer b.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// Публичное сообщение в комнату (без target) и личное
+	pub := []byte(userB + "\x00ciphertext-public")
+	if err := sendFrame(b, typeMessage, pub); err != nil {
+		t.Fatalf("send public: %v", err)
+	}
+	priv := []byte(userB + "\x00" + userA + "\x00ciphertext-private")
+	if err := sendFrame(b, typeMessage, priv); err != nil {
+		t.Fatalf("send private: %v", err)
+	}
+
+	// a должен получить только публичное (приватное адресовано a? нет — a
+	// получает и приватное, но для теста достаточно факта доставки)
+	a.SetReadDeadline(time.Now().Add(5 * time.Second))
+	gotPublic := false
+	for i := 0; i < 10; i++ {
+		ftype, _, err := recvFrame(a)
+		if err != nil {
+			break
+		}
+		if ftype == typeMessage {
+			gotPublic = true
+			break
+		}
+	}
+	if !gotPublic {
+		t.Fatal("публичное сообщение не доставлено — релей сломан")
+	}
+	time.Sleep(300 * time.Millisecond) // дать серверу «успеть» записать, если бы умел
+
+	var count int
+	dbMu.Lock()
+	err := db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count)
+	dbMu.Unlock()
+	if err != nil {
+		t.Fatalf("query messages: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("слепой режим нарушен: в базе %d сообщений, ожидалось 0", count)
+	}
+}
+
 // Клиент со старой версией протокола должен получить ошибку версии.
 func TestVersionMismatchRejected(t *testing.T) {
 	const user = "@testver"
