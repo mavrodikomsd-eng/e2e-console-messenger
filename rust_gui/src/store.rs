@@ -90,10 +90,14 @@ pub fn load_or_create_identity() -> (StaticSecret, String) {
             if parts.len() == 2 {
                 if let (Ok(seed), Ok(_)) = (B64.decode(parts[0]), B64.decode(parts[1])) {
                     if let Ok(s) = <[u8; 32]>::try_from(seed) {
-                        return (
-                            StaticSecret::from(s),
-                            B64.encode(PublicKey::from(s).as_bytes()),
-                        );
+                        // ВАЖНО: pub ВЫВОДИТСЯ из секрета. PublicKey::from([u8;32])
+                        // в dalek — это «принять байты как готовый ключ», раньше
+                        // сюда случайно попадал сид, и GUI публиковал свой
+                        // приватный ключ вместо публичного (никто не мог ему
+                        // написать).
+                        let secret = StaticSecret::from(s);
+                        let pub_bytes = PublicKey::from(&secret).to_bytes();
+                        return (secret, B64.encode(pub_bytes));
                     }
                 }
             }
@@ -101,14 +105,15 @@ pub fn load_or_create_identity() -> (StaticSecret, String) {
     }
     let mut seed = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut seed);
-    let pub_bytes = PublicKey::from(seed).to_bytes();
+    let secret = StaticSecret::from(seed);
+    let pub_bytes = PublicKey::from(&secret).to_bytes();
     if let Some(last) = paths.last() {
         let _ = write_file_secure(
             last,
             format!("{} {}\n", B64.encode(seed), B64.encode(pub_bytes)).as_bytes(),
         );
     }
-    (StaticSecret::from(seed), B64.encode(pub_bytes))
+    (secret, B64.encode(pub_bytes))
 }
 
 // ── TOFU ────────────────────────────────────────────────
