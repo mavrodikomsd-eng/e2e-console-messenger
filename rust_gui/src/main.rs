@@ -946,9 +946,24 @@ impl MeshApp {
                                             row.on_hover_text("Войти под этим аккаунтом");
                                         }
                                         ui.label(egui::RichText::new(format!("({}:{})", acc.host, acc.port)).size(10.5).color(TEXT_DIM));
-                                        if ui.small_button("✕").on_hover_text("Удалить").clicked() {
-                                            remove_idx = Some(i);
-                                        }
+                                // Двухшаговое удаление: первый ✕ ставит на «боевой взвод»,
+                                // второй — удаляет. Защита от случайного стирания аккаунта.
+                                let confirm_id = egui::Id::new("quicklogin_confirm_idx");
+                                let armed = ui.ctx().data_mut(|d| d.get_temp::<usize>(confirm_id)) == Some(i);
+                                let del_label = if armed { "точно ✕" } else { "✕" };
+                                let del_btn = ui.small_button(del_label).on_hover_text(if armed {
+                                    "Ещё раз — удалить навсегда"
+                                } else {
+                                    "Удалить (подтверждение двумя кликами)"
+                                });
+                                if del_btn.clicked() {
+                                    if armed {
+                                        remove_idx = Some(i);
+                                        ui.ctx().data_mut(|d| d.remove::<usize>(confirm_id));
+                                    } else {
+                                        ui.ctx().data_mut(|d| d.insert_temp(confirm_id, i));
+                                    }
+                                }
                                     });
                                 }
                                 if let Some(i) = remove_idx {
