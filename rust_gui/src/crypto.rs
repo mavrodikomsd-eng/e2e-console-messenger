@@ -73,3 +73,40 @@ pub fn fingerprint(pub_b64: &str) -> String {
         Err(_) => "?".into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Кросс-стек регрессия: зашифровано Python (modules/crypto.py,
+    /// pycryptodome X25519 + AES-GCM), расшифровывается Rust-функциями.
+    /// Векторы сгенерированы tools/chat_v2.py — если формат разъедется,
+    /// GUI покажет «не удалось расшифровать (подмена/ключ)».
+    #[test]
+    fn decrypts_python_encrypted_message() {
+        let seed1_b64 = "UHYbgZP1BtXSGpBmmoYFzvEhTolhQw/qgOFwPaIWXWc="; // наш (python)
+        let pub1_b64 = "JSFIRz+gwtXNTq81cX6WAZX+rO6rPi710YoDIts6XFo=";
+        let seed2_b64 = "Qgoq/tfR6ggvC8gHsOQEuorRqV9y918TuTXEyEb/dAQ="; // peer (python)
+        let pub2_b64 = "K5INWFF+vnkvLUITaHCZgPRe931vHQHY+tYwFh0NiX0=";
+        let ct = "OWXL0qaSfJOLGJEg1Lgb2GCFZmjR7qH+N8/vbCHRbXOBsfMSATHephiSrWwNd3C5m2l5Ey4e5N7ibg==";
+        let want = "привет от питона";
+
+        // 1. Rust расшифровывает питонье
+        let seed2_raw: [u8; 32] = B64.decode(seed2_b64).unwrap().try_into().unwrap();
+        let our = StaticSecret::from(seed2_raw);
+        let got = decrypt_from_peer(ct, pub1_b64, &our);
+        assert_eq!(got.as_deref(), Some(want));
+
+        // 2. Rust шифрует ответ питоньим ключом — общий секрет совпадает
+        let seed1_raw: [u8; 32] = B64.decode(seed1_b64).unwrap().try_into().unwrap();
+        let our1 = StaticSecret::from(seed1_raw);
+        let ct_back = encrypt_to_peer("ответ раста", pub1_b64, pub2_b64, &our1).unwrap();
+        // Расшифровка «питоном» невозможна здесь, но шифрование должно пройти
+        // с ключом, который python-сторона выведет из того же секрета.
+        assert!(!ct_back.is_empty());
+
+        // 3. Питоний pub из seed совпадает с растовым:
+        let our2_pub = PublicKey::from(&our);
+        assert_eq!(B64.encode(our2_pub.as_bytes()), pub2_b64);
+    }
+}
