@@ -164,7 +164,7 @@ fn message_beep() {
     let _ = std::io::stdout().write_all(b"\x07");
 }
 
-const APP_VERSION: &str = "v1.6.1";
+const APP_VERSION: &str = "v1.7.0";
 
 const SYS_CHAT: &str = "\u{1f4e1} Сервер";
 const ROOM_CHAT: &str = "# Общая комната";

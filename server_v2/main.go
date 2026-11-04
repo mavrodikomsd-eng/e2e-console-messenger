@@ -558,18 +558,21 @@ func handleClient(conn net.Conn, address string) {
 				break
 			}
 		} else if frameType == typeRegister {
-			if self == nil || !self.authed {
-				continue
-			}
+			// Публикация X25519-ключа. Раньше кадр отбрасывался до авторизации,
+			// из-за чего клиенты (GUI шлёт R при подключении) навсегда оставались
+			// с пустым pubkey — им не мог никто написать. Теперь R принимается
+			// в любой момент; activate() вызовется после /register//login.
 			parts := bytes.Split(payload, []byte{0})
-			if len(parts) >= 2 {
+			if self != nil && len(parts) >= 2 {
 				wasEmpty := self.pubkey == ""
 				self.pubkey = string(parts[1])
-				if !self.activated {
-					activate(self)
-				} else if wasEmpty {
-					sendFrameString(conn, typeCommand, encryptMessage("[ПУБКЛЮЧИ]"+pubKeysTable()))
-					broadcastFrame(typeCommand, []byte(encryptMessage("[НОВЫЙ]"+self.username+":"+self.pubkey)), conn)
+				if self.authed && self.pubkey != "" {
+					if !self.activated {
+						activate(self)
+					} else if wasEmpty {
+						sendFrameString(conn, typeCommand, encryptMessage("[ПУБКЛЮЧИ]"+pubKeysTable()))
+						broadcastFrame(typeCommand, []byte(encryptMessage("[НОВЫЙ]"+self.username+":"+self.pubkey)), conn)
+					}
 				}
 			}
 		}
