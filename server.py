@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import socket
 import threading
 import traceback
@@ -44,13 +45,15 @@ def save_accounts():
         json.dump(accounts, f, ensure_ascii=False, indent=2)
 
 
+USERNAME_RE = re.compile(r"^@?[\w]{3,16}$", re.UNICODE)
+
+
 def valid_username(name):
-    if not name or len(name) > 32:
-        return False
-    for ch in name:
-        if ch in "\x00;:\n\r":
-            return False
-    return True
+    """Ник: 3–16 букв/цифр/подчёркиваний (кириллица допустима), @ в начале —
+    допустим (формат v2). Раньше принималось что угодно длиной до 32 без
+    разделителей, из-за чего первая строка-команда клиента
+    («/register ник пароль…») проходила как имя."""
+    return bool(USERNAME_RE.match(name or ""))
 
 
 ARGON_TIME = 2
