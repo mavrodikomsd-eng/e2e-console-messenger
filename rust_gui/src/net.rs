@@ -159,6 +159,7 @@ fn room_targets(stream: &mut TcpStream, st: &NetState, shared_key: &[u8; 32], us
 fn handle_message(st: &NetState, our: &StaticSecret, payload: &[u8]) {
     let parts: Vec<&[u8]> = payload.split(|&b| b == 0).collect();
     if parts.len() < 3 {
+        eprintln!("[DBG-M] ДОСРОЧНЫЙ ВЫХОД: частей < 3");
         return;
     }
     let sender = String::from_utf8_lossy(parts[0]).to_string();
